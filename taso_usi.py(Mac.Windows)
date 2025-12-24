@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import subprocess
+import time
+import shlex
+import shutil
+from typing import List, Optional
+
+# =========================================================
+# TASO_USI — Safe USI Wrapper (Windows / macOS / Linux FINAL)
+#
+# Guarantees:
+# - 1 think = 1 process
+# - bestmove exactly once
+# - humanscore fallback guaranteed
+# - GUI / Ctrl+C safe
+# =========================================================
+
+ENGINE_TIMEOUT_SEC = float(os.environ.get("TASO_ENGINE_TIMEOUT", "3.0"))
+DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
+
+
+# ------------------------------------------------------------
+# helpers
+# ------------------------------------------------------------
+
+def out(line: str) -> None:
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def debug(msg: str) -> None:
+    if DEBUG:
+        sys.stderr.write("[TASO_USI] " + msg + "\n")
+        sys.stderr.flush()
+
+
+def ensure_humanscore(sent: bool) -> None:
+    if not sent:
+        out("info string humanscore=0.50")
+
+
+def terminate_process(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        t0 = time.time()
+        while time.time() - t0 < 0.25:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.01)
+        proc.kill()
+    except Exception:
+        pass
+
+
+def build_feed(options: List[str], position: str, go_cmd: str) -> str:
+    return "\n".join([
+        "usi",
+        "isready",
+        *options,
+        position,
+        go_cmd,
+        "quit",
+    ]) + "\n"
+
+
+# ------------------------------------------------------------
+# engine argv resolution
+# ------------------------------------------------------------
+
+def _wrap_argv(argv: List[str]) -> List[str]:
+    if not argv:
+        return []
+
+    exe = os.path.expanduser(argv[0])
+    rest = argv[1:]
+    ext = os.path.splitext(exe.lower())[1]
+
+    if ext == ".py":
+        return [sys.executable, exe, *rest]
+
+    if ext == ".sh":
+        bash = shutil.which("bash")
+        if not bash:
+            return []
+        return [bash, exe, *rest]
+
+    if os.name == "nt" and ext in (".bat", ".cmd"):
+        return ["cmd", "/c", exe, *rest]
+
+    return [exe, *rest]
+
+
+def resolve_engine_argv() -> List[str]:
+    env_cmd = os.environ.get("TASO_ENGINE_CMD")
+    if env_cmd:
+        return _wrap_argv(shlex.split(os.path.expanduser(env_cmd)))
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in (
+        "taso_engine_fukaura.exe",
+        "taso_engine_fukaura.bat",
+        "taso_engine_fukaura.cmd",
+        "taso_engine_fukaura.py",
+        "taso_engine_fukaura.sh",
+    ):
+        path = os.path.join(here, name)
+        if os.path.isfile(path):
+            return _wrap_argv([path])
+
+    return _wrap_argv([os.path.expanduser("~/shogi/wrapper/taso_engine_fukaura.sh")])
+
+
+# ------------------------------------------------------------
+# main USI loop
+# ------------------------------------------------------------
+
+def main() -> None:
+    current_position: Optional[str] = None
+    pending_options: List[str] = []
+
+    try:
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
+                continue
+
+            debug(f"IN: {line}")
+
+            # ---------- USI handshake ----------
+            if line == "usi":
+                out("id name TASO_USI")
+                out("id author taso")
+                out("usiok")
+                continue
+
+            if line == "isready":
+                out("readyok")
+                continue
+
+            # ---------- option / state ----------
+            if line.startswith("setoption"):
+                pending_options.append(line)
+                continue
+
+            if line.startswith("usinewgame"):
+                pending_options.clear()
+                continue
+
+            if line.startswith("position "):
+                current_position = line
+                continue
+
+            # ---------- go ----------
+            if line.startswith("go"):
+                engine_argv = resolve_engine_argv()
+                if not engine_argv:
+                    out("info string ERROR: TASO_ENGINE_CMD not found or not executable")
+                    out("info string Check TASO_ENGINE_CMD or engine file location")
+                    ensure_humanscore(False)
+                    out("bestmove resign")
+                    pending_options.clear()
+                    continue
+
+                # ★ 修正①: position 未指定時の保険
+                if not current_position:
+                    current_position = "position startpos"
+
+                feed = build_feed(pending_options, current_position, line)
+
+                proc: Optional[subprocess.Popen] = None
+                bestmove: Optional[str] = None
+                humanscore_sent = False
+
+                try:
+                    debug(f"RUN: {engine_argv}")
+
+                    proc = subprocess.Popen(
+                        engine_argv,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE if DEBUG else subprocess.DEVNULL,
+                        text=True,
+                        bufsize=1,
+                    )
+                    assert proc.stdin and proc.stdout
+
+                    proc.stdin.write(feed)
+                    proc.stdin.flush()
+                    proc.stdin.close()
+
+                    start = time.time()
+
+                    while True:
+                        # ★ 修正②: タイムアウト時に info を出す
+                        if time.time() - start > ENGINE_TIMEOUT_SEC:
+                            out("info string engine timeout")
+                            debug("ENGINE TIMEOUT")
+                            break
+
+                        out_line = proc.stdout.readline()
+                        if not out_line:
+                            break
+
+                        s = out_line.rstrip("\n")
+                        if not s:
+                            continue
+
+                        if s.startswith(("id ", "usiok", "readyok")):
+                            continue
+
+                        if s.startswith("info "):
+                            if "humanscore" in s:
+                                humanscore_sent = True
+                            out(s)
+                            continue
+
+                        if s.startswith("bestmove"):
+                            bestmove = s
+                            break
+
+                        out(s)
+
+                    ensure_humanscore(humanscore_sent)
+                    out(bestmove if bestmove else "bestmove resign")
+
+                except Exception as e:
+                    out(f"info string ERROR: {type(e).__name__}: {e}")
+                    ensure_humanscore(False)
+                    out("bestmove resign")
+
+                finally:
+                    pending_options.clear()
+                    if proc:
+                        terminate_process(proc)
+
+                continue
+
+            # ---------- quit ----------
+            if line == "quit":
+                break
+
+            debug(f"IGNORED: {line}")
+
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
