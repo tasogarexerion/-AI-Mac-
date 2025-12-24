@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import subprocess
+import time
+import math
+import random
+import re
+import threading
+import queue
+from typing import Dict, Optional, List, Tuple
+
+# =========================================================
+# TASO Engine (Python) — FUKAURAOU ONLY
+# FINAL FULL VERSION (NO FEATURE REMOVED)
+# =========================================================
+
+# ---------------------------------------------------------
+# Environment / paths
+# ---------------------------------------------------------
+TASO_SHOW  = os.environ.get("TASO_SHOW",  "1") == "1"
+TASO_DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
+
+FUKA_BIN = os.environ.get(
+    "FUKA_BIN",
+    os.path.expanduser("~/shogi/engines/fukaura/fukauraou")
+)
+
+TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
+TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
+TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
+
+# ---------------------------------------------------------
+# Evaluation thresholds
+# ---------------------------------------------------------
+TASO_WIN_CP  = int(os.environ.get("TASO_WIN_CP",  "300"))
+TASO_LOSE_CP = int(os.environ.get("TASO_LOSE_CP", "-300"))
+ENDGAME_CP   = int(os.environ.get("TASO_ENDGAME_CP", "800"))
+
+TASO_STABLE_DROP    = int(os.environ.get("TASO_STABLE_DROP", "120"))
+TASO_PREFIX_K       = int(os.environ.get("TASO_PREFIX_K", "4"))
+TASO_ANNOY_MAX_DROP = int(os.environ.get("TASO_ANNOY_MAX_DROP", "180"))
+
+TASO_SHORT_MATE_MAX   = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
+TASO_LONG_MATE_IGNORE = int(os.environ.get("TASO_LONG_MATE_IGNORE", "10"))
+
+TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
+TASO_HISSHI_MAX_DROP   = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
+TASO_HISSHI_MIN_LINES  = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
+
+READ_TIMEOUT_SEC = float(os.environ.get("TASO_READ_TIMEOUT", "2.0"))
+LINE_LIMIT       = int(os.environ.get("TASO_LINE_LIMIT", "6000"))
+
+# ---------------------------------------------------------
+# HumanScore hysteresis
+# ---------------------------------------------------------
+HS_STABLE_ENTER = 0.65
+HS_STABLE_EXIT  = 0.60
+HS_ANNOY_ENTER  = 0.40
+HS_ANNOY_EXIT   = 0.45
+
+MODE_NORMAL = "NORMAL"
+MODE_STABLE = "STABLE"
+MODE_ANNOY  = "ANNOY"
+
+# ---------------------------------------------------------
+# IO helpers
+# ---------------------------------------------------------
+def out(s: str) -> None:
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+def say(s: str) -> None:
+    if TASO_SHOW:
+        out("info string " + s)
+
+# ---------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------
+def clamp(x, lo, hi): return max(lo, min(hi, x))
+
+def human_score(cp: int) -> float:
+    x = cp / 450.0
+    h = 1.0 / (1.0 + math.exp(-x))
+    if abs(cp) >= ENDGAME_CP:
+        h = 0.5 + (h - 0.5) * 0.6
+    return clamp(h, 0.01, 0.99)
+
+def common_prefix_len(a: str, b: str, k: int) -> int:
+    aa, bb = a.split(), b.split()
+    for i in range(min(k, len(aa), len(bb))):
+        if aa[i] != bb[i]:
+            return i
+    return min(k, len(aa), len(bb))
+
+def parse_mate(m: Optional[str]) -> Optional[int]:
+    try:
+        return int(m)
+    except:
+        return None
+
+# ---------------------------------------------------------
+# Hysteresis
+# ---------------------------------------------------------
+class HysteresisState:
+    def __init__(self):
+        self.mode = MODE_NORMAL
+
+    def update(self, hs: float) -> str:
+        if self.mode == MODE_NORMAL:
+            if hs >= HS_STABLE_ENTER:
+                self.mode = MODE_STABLE
+            elif hs <= HS_ANNOY_ENTER:
+                self.mode = MODE_ANNOY
+        elif self.mode == MODE_STABLE and hs <= HS_STABLE_EXIT:
+            self.mode = MODE_NORMAL
+        elif self.mode == MODE_ANNOY and hs >= HS_ANNOY_EXIT:
+            self.mode = MODE_NORMAL
+        return self.mode
+
+# ---------------------------------------------------------
+# Child engine
+# ---------------------------------------------------------
+class ChildEngine:
+    def __init__(self, cmd):
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self.q = queue.Queue()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        for line in self.proc.stdout:
+            self.q.put(line.rstrip())
+
+    def send(self, s):
+        try:
+            self.proc.stdin.write(s + "\n")
+            self.proc.stdin.flush()
+        except:
+            pass
+
+    def recv(self, timeout):
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+# ---------------------------------------------------------
+# PV store
+# ---------------------------------------------------------
+class PVStore:
+    def __init__(self):
+        self.move = {}
+        self.cp = {}
+        self.mate = {}
+        self.pv = {}
+        self.depth = {}
+
+    def reset(self):
+        self.__init__()
+
+# ---------------------------------------------------------
+# Move pickers
+# ---------------------------------------------------------
+def is_hisshi_position(pvs: PVStore) -> bool:
+    if 1 not in pvs.pv or 1 not in pvs.cp:
+        return False
+    hits = 0
+    for i in range(2, TASO_MULTIPV + 1):
+        if i in pvs.pv and i in pvs.cp:
+            if common_prefix_len(pvs.pv[1], pvs.pv[i], TASO_PREFIX_K) >= TASO_HISSHI_PREFIX_MIN:
+                if abs(pvs.cp[1] - pvs.cp[i]) <= TASO_HISSHI_MAX_DROP:
+                    hits += 1
+    return hits >= TASO_HISSHI_MIN_LINES
+
+def pick_stable_winning_move(pvs: PVStore):
+    return pvs.move.get(1)
+
+def pick_annoying_losing_move(pvs: PVStore):
+    keys = list(pvs.move.keys())
+    return pvs.move.get(random.choice(keys)) if keys else None
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+def main():
+    eng = ChildEngine([FUKA_BIN])
+    pvs = PVStore()
+    hys = HysteresisState()
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+
+        if line == "usi":
+            eng.send("usi")
+            while True:
+                o = eng.recv(1)
+                if o:
+                    out(o)
+                    if o == "usiok":
+                        break
+            continue
+
+        if line == "isready":
+            eng.send("isready")
+            while True:
+                o = eng.recv(1)
+                if o == "readyok":
+                    break
+            out("readyok")
+            continue
+
+        if line.startswith("position"):
+            eng.send(line)
+            continue
+
+        if line.startswith("go"):
+            pvs.reset()
+            eng.send(line)
+            best_engine = None
+
+            for _ in range(LINE_LIMIT):
+                o = eng.recv(READ_TIMEOUT_SEC)
+                if not o:
+                    break
+
+                if o.startswith("info"):
+                    out(o)
+                    t = o.split()
+                    mpv = int(t[t.index("multipv")+1]) if "multipv" in t else 1
+                    if "pv" in t:
+                        i = t.index("pv")
+                        pvs.pv[mpv] = " ".join(t[i+1:])
+                        pvs.move[mpv] = t[i+1]
+                    if "cp" in t:
+                        pvs.cp[mpv] = int(t[t.index("cp")+1])
+                    if "mate" in t:
+                        pvs.mate[mpv] = t[t.index("mate")+1]
+
+                if o.startswith("bestmove"):
+                    best_engine = o.split()[1]
+                    break
+
+            cp1 = pvs.cp.get(1, 0)
+            hs = human_score(cp1)
+            mode = hys.update(hs)
+            say(f"humanscore={hs:.2f} mode={mode}")
+
+            override = best_engine or "resign"
+
+            if is_hisshi_position(pvs):
+                say("🔒 hisshi priority")
+                override = pick_stable_winning_move(pvs) or override
+            elif mode == MODE_STABLE:
+                say("🧱 stable mode")
+                override = pick_stable_winning_move(pvs) or override
+            elif mode == MODE_ANNOY:
+                say("🪤 annoy mode")
+                override = pick_annoying_losing_move(pvs) or override
+
+            out(f"bestmove {override}")
+            continue
+
+        if line == "quit":
+            break
+
+        eng.send(line)
+
+if __name__ == "__main__":
+    main()
