@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+TASO Engine — Hysteresis + HumanScore Decision Layer
+===================================================
+
+USI wrapper for NNUE engines.
+Adds:
+- humanscore-based evaluation
+- hysteresis-based play-mode switching
+- stable / hisshi / annoying personalities
+- reader thread + queue (Windows safe)
+
+Decision priority:
+  Short mate
+  > Hisshi (latched)
+  > Stable win
+  > Annoying loss
+"""
+
+import os
+import sys
+import subprocess
+import time
+import math
+import random
+import re
+import threading
+import queue
+from enum import Enum, auto
+from typing import Dict, Optional, List
+
+# ---------------------------------------------------------
+# Engine path
+# ---------------------------------------------------------
+ENGINE_EXE = os.environ.get(
+    "TASO_ENGINE_EXE",
+    r"C:\shogi\engines\nnue_engine\nnue_engine.exe"
+)
+
+# ---------------------------------------------------------
+# Environment
+# ---------------------------------------------------------
+TASO_SHOW  = os.environ.get("TASO_SHOW",  "1") == "1"
+TASO_DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
+
+TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
+TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
+TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
+
+# ---------------------------------------------------------
+# Evaluation thresholds
+# ---------------------------------------------------------
+TASO_WIN_CP  = int(os.environ.get("TASO_WIN_CP",  "300"))
+TASO_LOSE_CP = int(os.environ.get("TASO_LOSE_CP", "-300"))
+ENDGAME_CP   = int(os.environ.get("TASO_ENDGAME_CP", "800"))
+
+TASO_STABLE_DROP    = int(os.environ.get("TASO_STABLE_DROP", "120"))
+TASO_PREFIX_K       = int(os.environ.get("TASO_PREFIX_K", "4"))
+TASO_ANNOY_MAX_DROP = int(os.environ.get("TASO_ANNOY_MAX_DROP", "180"))
+
+# Mate / hisshi
+TASO_SHORT_MATE_MAX   = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
+TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
+TASO_HISSHI_MAX_DROP   = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
+TASO_HISSHI_MIN_LINES  = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
+
+# IO safety
+READ_TIMEOUT   = float(os.environ.get("TASO_READ_TIMEOUT", "0.5"))
+GO_TIMEOUT_SEC = float(os.environ.get("TASO_GO_TIMEOUT", "10.0"))
+LINE_LIMIT     = int(os.environ.get("TASO_LINE_LIMIT", "6000"))
+
+# ---------------------------------------------------------
+# Hysteresis thresholds (HumanScore)
+# ---------------------------------------------------------
+HS_STABLE_ENTER = float(os.environ.get("HS_STABLE_ENTER", "0.60"))
+HS_STABLE_EXIT  = float(os.environ.get("HS_STABLE_EXIT",  "0.55"))
+HS_ANNOY_ENTER  = float(os.environ.get("HS_ANNOY_ENTER",  "0.40"))
+HS_ANNOY_EXIT   = float(os.environ.get("HS_ANNOY_EXIT",   "0.45"))
+
+# ---------------------------------------------------------
+# Logging
+# ---------------------------------------------------------
+def out(s: str) -> None:
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+def dbg(s: str) -> None:
+    if TASO_DEBUG:
+        sys.stderr.write("[TASO] " + s + "\n")
+        sys.stderr.flush()
+
+def say(s: str) -> None:
+    if TASO_SHOW:
+        out("info string " + s)
+
+# ---------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------
+_INT_RE = re.compile(r"^-?\d+$")
+
+def is_int(s: str) -> bool:
+    return bool(_INT_RE.match(s))
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def human_score(cp: int) -> float:
+    x = cp / 450.0
+    h = 1.0 / (1.0 + math.exp(-x))
+    if abs(cp) >= ENDGAME_CP:
+        h = 0.5 + (h - 0.5) * 0.6
+    return clamp(h, 0.01, 0.99)
+
+def common_prefix_len(a: str, b: str, k: int) -> int:
+    aa, bb = a.split(), b.split()
+    for i in range(min(k, len(aa), len(bb))):
+        if aa[i] != bb[i]:
+            return i
+    return min(k, len(aa), len(bb))
+
+def parse_mate(m: Optional[str]) -> Optional[int]:
+    try:
+        return int(m) if m is not None else None
+    except Exception:
+        return None
+
+# ---------------------------------------------------------
+# Turn detection
+# ---------------------------------------------------------
+def turn_sign_from_position(line: str) -> int:
+    t = line.split()
+    if len(t) < 2:
+        return 1
+    if t[1] == "startpos":
+        if "moves" in t:
+            c = len(t) - t.index("moves") - 1
+            return 1 if c % 2 == 0 else -1
+        return 1
+    if t[1] == "sfen":
+        for x in t[2:]:
+            if x == "b":
+                return 1
+            if x == "w":
+                return -1
+    return 1
+
+# ---------------------------------------------------------
+# Child engine (reader thread)
+# ---------------------------------------------------------
+class ChildEngine:
+    def __init__(self, exe: str) -> None:
+        flags = 0x08000000 if os.name == "nt" else 0
+        self.proc = subprocess.Popen(
+            [exe],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            creationflags=flags,
+        )
+        self.q: "queue.Queue[str]" = queue.Queue()
+        self.stop = threading.Event()
+        self.t = threading.Thread(target=self._reader, daemon=True)
+        self.t.start()
+
+    def _reader(self) -> None:
+        try:
+            for line in self.proc.stdout:
+                if self.stop.is_set():
+                    break
+                self.q.put(line.rstrip("\n"))
+        except Exception:
+            pass
+
+    def send(self, s: str) -> None:
+        try:
+            self.proc.stdin.write(s + "\n")
+            self.proc.stdin.flush()
+        except Exception:
+            pass
+
+    def readline(self, timeout: float) -> Optional[str]:
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def flush(self) -> None:
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+
+    def close(self) -> None:
+        try:
+            self.stop.set()
+            self.send("quit")
+            self.proc.terminate()
+        except Exception:
+            pass
+
+# ---------------------------------------------------------
+# PV Store
+# ---------------------------------------------------------
+class PVStore:
+    def __init__(self) -> None:
+        self.move: Dict[int, str] = {}
+        self.cp: Dict[int, int] = {}
+        self.mate: Dict[int, str] = {}
+        self.pv: Dict[int, str] = {}
+        self.depth: Dict[int, int] = {}
+
+    def reset(self) -> None:
+        self.move.clear()
+        self.cp.clear()
+        self.mate.clear()
+        self.pv.clear()
+        self.depth.clear()
+
+    def snap(self, mpv, depth, mv, pv, cp, mate) -> None:
+        if depth < self.depth.get(mpv, -1):
+            return
+        self.depth[mpv] = depth
+        if mv:
+            self.move[mpv] = mv
+        if pv:
+            self.pv[mpv] = pv
+        if cp is not None:
+            self.cp[mpv] = cp
+        if mate:
+            self.mate[mpv] = mate
+
+# ---------------------------------------------------------
+# PlayMode (hysteresis)
+# ---------------------------------------------------------
+class PlayMode(Enum):
+    UNKNOWN = auto()
+    STABLE  = auto()
+    HISSHI  = auto()
+    ANNOY   = auto()
+
+def update_play_mode(prev: PlayMode, hs: float, hisshi: bool) -> PlayMode:
+    if hisshi:
+        return PlayMode.HISSHI
+
+    if prev == PlayMode.STABLE:
+        return PlayMode.STABLE if hs >= HS_STABLE_EXIT else PlayMode.UNKNOWN
+
+    if prev == PlayMode.ANNOY:
+        return PlayMode.ANNOY if hs <= HS_ANNOY_EXIT else PlayMode.UNKNOWN
+
+    if hs >= HS_STABLE_ENTER:
+        return PlayMode.STABLE
+    if hs <= HS_ANNOY_ENTER:
+        return PlayMode.ANNOY
+
+    return prev
+
+# ---------------------------------------------------------
+# Heuristics
+# ---------------------------------------------------------
+def is_hisshi(pvs: PVStore) -> bool:
+    if 1 not in pvs.pv or 1 not in pvs.cp:
+        return False
+    base_pv, base_cp = pvs.pv[1], pvs.cp[1]
+    hits = 0
+    for i in range(2, TASO_MULTIPV + 1):
+        pv, cp = pvs.pv.get(i), pvs.cp.get(i)
+        if not pv or cp is None:
+            continue
+        if common_prefix_len(base_pv, pv, TASO_PREFIX_K) >= TASO_HISSHI_PREFIX_MIN and abs(base_cp - cp) <= TASO_HISSHI_MAX_DROP:
+            hits += 1
+    return hits >= TASO_HISSHI_MIN_LINES
+
+def pick_stable(pvs: PVStore) -> Optional[str]:
+    base_cp = pvs.cp.get(1, 0)
+    base_pv = pvs.pv.get(1, "")
+    best, best_score = pvs.move.get(1), -10**9
+    for i in range(1, TASO_MULTIPV + 1):
+        mv, cp, pv = pvs.move.get(i), pvs.cp.get(i), pvs.pv.get(i, "")
+        if not mv or cp is None:
+            continue
+        drop = max(0, base_cp - cp)
+        if drop > TASO_STABLE_DROP:
+            continue
+        score = -drop + common_prefix_len(base_pv, pv, TASO_PREFIX_K) * 5
+        if score > best_score:
+            best, best_score = mv, score
+    return best
+
+def pick_annoy(pvs: PVStore) -> Optional[str]:
+    base_cp = pvs.cp.get(1, 0)
+    base_pv = pvs.pv.get(1, "")
+    best_score, cand = -10**9, []
+    for i in range(2, TASO_MULTIPV + 1):
+        mv, cp, pv = pvs.move.get(i), pvs.cp.get(i), pvs.pv.get(i, "")
+        if not mv or cp is None:
+            continue
+        drop = base_cp - cp
+        if drop > TASO_ANNOY_MAX_DROP:
+            continue
+        pref = common_prefix_len(base_pv, pv, TASO_PREFIX_K)
+        score = (TASO_PREFIX_K - pref) * 10
+        if pref == 2:
+            score += 40
+        elif pref == 1:
+            score += 18
+        if score > best_score:
+            best_score, cand = score, [mv]
+        elif score == best_score:
+            cand.append(mv)
+    return random.choice(cand) if cand else pvs.move.get(1)
+
+# ---------------------------------------------------------
+# Main USI loop
+# ---------------------------------------------------------
+def main() -> None:
+    if not os.path.isfile(ENGINE_EXE):
+        out("id name TASO (engine missing)")
+        out("id author taso")
+        out("usiok")
+        return
+
+    eng = ChildEngine(ENGINE_EXE)
+    pvs = PVStore()
+    play_mode = PlayMode.UNKNOWN
+    turn = 1
+    last_pos = "position startpos"
+
+    def apply_opts() -> None:
+        eng.send(f"setoption name Threads value {TASO_THREADS}")
+        eng.send(f"setoption name Hash value {TASO_HASH_MB}")
+        eng.send(f"setoption name MultiPV value {TASO_MULTIPV}")
+
+    try:
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
+                continue
+
+            if line == "usi":
+                eng.send("usi")
+                while True:
+                    r = eng.readline(READ_TIMEOUT)
+                    if r and r.startswith("usiok"):
+                        break
+                out("id name TASO (Hysteresis)")
+                out("id author taso")
+                out("usiok")
+                apply_opts()
+                continue
+
+            if line == "isready":
+                eng.send("isready")
+                out("readyok")
+                continue
+
+            if line.startswith("position"):
+                last_pos = line
+                turn = turn_sign_from_position(line)
+                eng.send(line)
+                continue
+
+            if line.startswith("go"):
+                pvs.reset()
+                eng.flush()
+                eng.send(last_pos)
+                eng.send(line)
+
+                best_engine = None
+                start = time.time()
+
+                for _ in range(LINE_LIMIT):
+                    if time.time() - start > GO_TIMEOUT_SEC:
+                        eng.send("stop")
+                        break
+                    m = eng.readline(READ_TIMEOUT)
+                    if m is None:
+                        continue
+                    if m.startswith("info"):
+                        out(m)
+                        t = m.split()
+                        mpv = int(t[t.index("multipv")+1]) if "multipv" in t else 1
+                        depth = int(t[t.index("depth")+1]) if "depth" in t else 0
+                        cp = None
+                        if "cp" in t:
+                            i = t.index("cp")
+                            if i+1 < len(t) and is_int(t[i+1]):
+                                cp = int(t[i+1]) * turn
+                        mate = t[t.index("mate")+1] if "mate" in t else None
+                        mv = pv = None
+                        if "pv" in t:
+                            i = t.index("pv")
+                            pv = " ".join(t[i+1:])
+                            mv = t[i+1]
+                        pvs.snap(mpv, depth, mv, pv, cp, mate)
+                        continue
+                    if m.startswith("bestmove"):
+                        best_engine = m.split()[1]
+                        break
+
+                cp1 = pvs.cp.get(1, 0)
+                hs = human_score(cp1)
+                out(f"info string humanscore={hs:.2f}")
+
+                play_mode = update_play_mode(play_mode, hs, is_hisshi(pvs))
+
+                override = best_engine or "resign"
+
+                best_len, best_mv = None, None
+                for i, m in pvs.mate.items():
+                    mt = parse_mate(m)
+                    if mt and (best_len is None or mt < best_len):
+                        best_len, best_mv = mt, pvs.move.get(i)
+
+                if best_len is not None and best_len <= TASO_SHORT_MATE_MAX:
+                    say(f"⚡ short mate {best_len}")
+                    override = best_mv or override
+                elif play_mode == PlayMode.HISSHI:
+                    say("🔒 hisshi mode")
+                    override = pick_stable(pvs) or override
+                elif play_mode == PlayMode.STABLE:
+                    say("🧱 stable mode")
+                    override = pick_stable(pvs) or override
+                elif play_mode == PlayMode.ANNOY:
+                    say("🪤 annoy mode")
+                    override = pick_annoy(pvs) or override
+
+                out(f"bestmove {override}")
+                apply_opts()
+                continue
+
+            if line == "quit":
+                break
+
+            eng.send(line)
+
+    finally:
+        eng.close()
+
+if __name__ == "__main__":
+    main()
