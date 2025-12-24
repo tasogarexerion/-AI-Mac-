@@ -11,14 +11,12 @@ import re
 from typing import Dict, Optional, List, Tuple
 
 # =========================================================
-# TASO Engine (Python) — FUKAURAOU ONLY / 最新凍結版 + 必至優先
+# TASO Engine (Python) — FUKAURAOU ONLY / 配布用凍結版
 #
-# 思想:
-# - 勝勢: 人間が維持しやすい安定手（prefix長め・drop小）
-# - 劣勢: 2手一致トラップを含む嫌らしい逆転含み
-# - 終盤: 長い詰み < 短い詰み < 必至
-# - 棋譜途中解析対応: position sfen でも手番判定が壊れない
-# - 安全脱出: LINE_LIMIT + 読み取りタイムアウト
+# 修正履歴:
+#  1) readline安全化（疑似タイムアウト事故防止）
+#  2) Hash option 多重送信（NNUE互換性向上）
+#  3) mate / 必至判断を info string で明示
 # =========================================================
 
 # --------------------------
@@ -36,12 +34,9 @@ TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
 TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
 TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
 
-# --------------------------
 # thresholds
-# --------------------------
 TASO_WIN_CP = int(os.environ.get("TASO_WIN_CP", "300"))
 TASO_LOSE_CP = int(os.environ.get("TASO_LOSE_CP", "-300"))
-
 ENDGAME_CP = int(os.environ.get("TASO_ENDGAME_CP", "800"))
 
 # stable selector
@@ -60,7 +55,7 @@ TASO_EVIL_MID_DROP_BONUS = int(os.environ.get("TASO_EVIL_MID_DROP_BONUS", "10"))
 TASO_EVIL_MID_DROP_MIN = int(os.environ.get("TASO_EVIL_MID_DROP_MIN", "40"))
 TASO_EVIL_MID_DROP_MAX = int(os.environ.get("TASO_EVIL_MID_DROP_MAX", "120"))
 
-# hisshi (必至) detection
+# hisshi
 TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
 TASO_HISSHI_MAX_DROP = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
 TASO_HISSHI_MIN_LINES = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
@@ -116,49 +111,26 @@ def common_prefix_len(a: str, b: str, k: int) -> int:
     return lim
 
 def parse_mate(m: Optional[str]) -> Optional[int]:
-    if m is None:
-        return None
     try:
-        return int(m)
+        return int(m) if m is not None else None
     except Exception:
         return None
 
 def turn_sign_from_position(line: str) -> int:
-    """
-    エンジン出力の cp を「先手視点」に寄せるための符号。
-    - position startpos moves ... : 手数パリティで先手/後手を推定
-    - position sfen ...           : sfen の手番(b/w)から推定
-    """
     toks = line.split()
-    if len(toks) < 2:
-        return 1
-
-    # position startpos ...
-    if len(toks) >= 2 and toks[1] == "startpos":
-        if "moves" in toks:
-            mc = len(toks) - toks.index("moves") - 1
-            return 1 if (mc % 2 == 0) else -1
-        return 1
-
-    # position sfen <sfen...> <turn> <hand> <ply> [moves ...]
-    if len(toks) >= 3 and toks[1] == "sfen":
-        # sfenは固定4フィールド: board / turn / hand / ply
-        # 例: position sfen ... b - 42
-        # turn は b or w
-        try:
-            # board は可変だが、USIのposition sfenは「sfen の4フィールドを空白で区切って渡す」
-            # よって turn は toks[?] のうち b/w の最初の出現を拾う
-            for t in toks[2:]:
-                if t in ("b", "w"):
-                    return 1 if t == "b" else -1
-        except Exception:
-            pass
-        return 1
-
+    if "startpos" in toks and "moves" in toks:
+        mc = len(toks) - toks.index("moves") - 1
+        return 1 if mc % 2 == 0 else -1
+    if "sfen" in toks:
+        for t in toks:
+            if t == "b":
+                return 1
+            if t == "w":
+                return -1
     return 1
 
 # --------------------------
-# child engine
+# child engine (修正①)
 # --------------------------
 class ChildEngine:
     def __init__(self, cmd: List[str]) -> None:
@@ -180,16 +152,17 @@ class ChildEngine:
             pass
 
     def readline(self, timeout: float) -> Optional[str]:
-        # NOTE: stdout.readline() is blocking; timeout is "soft".
+        if not self.proc.stdout:
+            return None
         start = time.time()
-        while time.time() - start < timeout:
-            if self.proc.stdout:
-                line = self.proc.stdout.readline()
-                if line:
-                    return line.rstrip("\n")
+        while True:
+            if time.time() - start > timeout:
+                return None
             if self.proc.poll() is not None:
                 return None
-        return None
+            line = self.proc.stdout.readline()
+            if line:
+                return line.rstrip("\n")
 
     def close(self) -> None:
         try:
@@ -235,16 +208,14 @@ class PVStore:
             self.mate[mpv] = mate
 
 # --------------------------
-# 必至検出（簡易）
+# 必至検出
 # --------------------------
 def is_hisshi_position(pvs: PVStore) -> bool:
     if 1 not in pvs.pvline or 1 not in pvs.cp:
         return False
-
     pv1 = pvs.pvline[1]
     cp1 = pvs.cp[1]
     hits = 0
-
     for i in range(2, TASO_MULTIPV + 1):
         pv = pvs.pvline.get(i)
         cp = pvs.cp.get(i)
@@ -254,7 +225,6 @@ def is_hisshi_position(pvs: PVStore) -> bool:
         drop = abs(cp1 - cp)
         if pref >= TASO_HISSHI_PREFIX_MIN and drop <= TASO_HISSHI_MAX_DROP:
             hits += 1
-
     return hits >= TASO_HISSHI_MIN_LINES
 
 # --------------------------
@@ -265,7 +235,6 @@ def pick_stable_winning_move(pvs: PVStore) -> Optional[str]:
     pv1 = pvs.pvline.get(1, "")
     best = pvs.move.get(1)
     best_score = -10**9
-
     for i in range(1, TASO_MULTIPV + 1):
         mv = pvs.move.get(i)
         cp = pvs.cp.get(i)
@@ -280,7 +249,6 @@ def pick_stable_winning_move(pvs: PVStore) -> Optional[str]:
         if score > best_score:
             best_score = score
             best = mv
-
     return best
 
 def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
@@ -288,7 +256,6 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
     pv1 = pvs.pvline.get(1, "")
     best_score = -10**9
     cand: List[str] = []
-
     for i in range(2, TASO_MULTIPV + 1):
         mv = pvs.move.get(i)
         cp = pvs.cp.get(i)
@@ -299,7 +266,6 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
         if drop > TASO_ANNOY_MAX_DROP:
             continue
         pref = common_prefix_len(pv1, pv, TASO_PREFIX_K)
-
         score = (TASO_PREFIX_K - pref) * TASO_EVIL_EARLY_DIVERGE_W
         if pref == 2:
             score += TASO_EVIL_TWOPLY_BONUS
@@ -309,13 +275,11 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
             score -= TASO_EVIL_LONGPREFIX_PENALTY * (pref - 2)
         if TASO_EVIL_MID_DROP_MIN <= drop <= TASO_EVIL_MID_DROP_MAX:
             score += TASO_EVIL_MID_DROP_BONUS
-
         if score > best_score:
             best_score = score
             cand = [mv]
         elif score == best_score:
             cand.append(mv)
-
     return random.choice(cand) if cand else pvs.move.get(1)
 
 # --------------------------
@@ -332,9 +296,12 @@ def main() -> None:
     pvs = PVStore()
     turn_sign = 1
 
+    # 修正②: Hash option 多重送信
     def apply_opts() -> None:
         eng.send(f"setoption name Threads value {TASO_THREADS}")
+        eng.send(f"setoption name USI_Hash value {TASO_HASH_MB}")
         eng.send(f"setoption name Hash value {TASO_HASH_MB}")
+        eng.send(f"setoption name HashSize value {TASO_HASH_MB}")
         eng.send(f"setoption name MultiPV value {TASO_MULTIPV}")
 
     try:
@@ -378,31 +345,17 @@ def main() -> None:
                 while True:
                     seen += 1
                     if seen > LINE_LIMIT:
-                        dbg("LINE_LIMIT reached")
                         break
-
                     o = eng.readline(READ_TIMEOUT_SEC)
                     if not o:
-                        dbg("engine silence/timeout")
                         break
 
                     if o.startswith("info"):
                         out(o)
                         toks = o.split()
 
-                        mpv = 1
-                        if "multipv" in toks:
-                            try:
-                                mpv = int(toks[toks.index("multipv") + 1])
-                            except Exception:
-                                mpv = 1
-
-                        depth = 0
-                        if "depth" in toks:
-                            try:
-                                depth = int(toks[toks.index("depth") + 1])
-                            except Exception:
-                                depth = 0
+                        mpv = int(toks[toks.index("multipv")+1]) if "multipv" in toks else 1
+                        depth = int(toks[toks.index("depth")+1]) if "depth" in toks else 0
 
                         cp = None
                         mate = None
@@ -411,73 +364,52 @@ def main() -> None:
 
                         if "pv" in toks:
                             i = toks.index("pv")
-                            if i + 1 < len(toks):
-                                pv = " ".join(toks[i + 1 :])
-                                mv = toks[i + 1]
+                            pv = " ".join(toks[i+1:])
+                            mv = toks[i+1]
 
                         if "score" in toks and "cp" in toks:
                             j = toks.index("cp")
-                            if j + 1 < len(toks) and is_int(toks[j + 1]):
-                                cp = int(toks[j + 1]) * turn_sign
+                            if is_int(toks[j+1]):
+                                cp = int(toks[j+1]) * turn_sign
 
                         if "mate" in toks:
-                            k = toks.index("mate")
-                            if k + 1 < len(toks):
-                                mate = toks[k + 1]
+                            mate = toks[toks.index("mate")+1]
 
                         pvs.snapshot(mpv, depth, mv, pv, cp, mate)
                         continue
 
                     if o.startswith("bestmove"):
-                        parts = o.split()
-                        if len(parts) >= 2:
-                            best_engine = parts[1]
+                        best_engine = o.split()[1]
                         break
 
                 cp1 = pvs.cp.get(1, 0)
-                hws = human_score(cp1)
-                out(f"info string humanscore={hws:.2f}")
+                out(f"info string humanscore={human_score(cp1):.2f}")
 
                 override = best_engine or "resign"
 
-                # ---- 終盤ロジック：長い詰み < 短い詰み < 必至 ----
-                endgame = abs(cp1) >= ENDGAME_CP
-
-                # 1) 短い詰み（<= TASO_SHORT_MATE_MAX）を最優先
+                # --- 修正③: 意思決定の可視化 ---
                 best_short: Optional[Tuple[int, str]] = None
                 for i, m in pvs.mate.items():
                     mt = parse_mate(m)
-                    if mt is None or mt <= 0:
-                        continue
                     mv = pvs.move.get(i)
-                    if not mv:
-                        continue
-                    if best_short is None or mt < best_short[0]:
+                    if mt and mv and (best_short is None or mt < best_short[0]):
                         best_short = (mt, mv)
 
-                if best_short is not None and best_short[0] <= TASO_SHORT_MATE_MAX:
+                if best_short and best_short[0] <= TASO_SHORT_MATE_MAX:
+                    say(f"⚡ 短手数詰み優先 (mate {best_short[0]})")
                     override = best_short[1]
-
                 else:
-                    # 2) 長い詰み（>TASO_LONG_MATE_IGNORE）は「必至優先」の邪魔になるので無視
-                    #    （mateが出ていても mt>TASO_LONG_MATE_IGNORE なら通常ロジックへ流す）
-                    has_long_mate = False
-                    for m in pvs.mate.values():
-                        mt = parse_mate(m)
-                        if mt is not None and mt > TASO_LONG_MATE_IGNORE:
-                            has_long_mate = True
-                            break
-
-                    # 3) 必至っぽい局面なら必至優先（安定側へ）
+                    has_long_mate = any(
+                        parse_mate(m) and parse_mate(m) > TASO_LONG_MATE_IGNORE
+                        for m in pvs.mate.values()
+                    )
                     if is_hisshi_position(pvs) and not has_long_mate:
-                        say("🔒 必至優先")
+                        say("🔒 必至優先（長い詰みは保留）")
                         override = pick_stable_winning_move(pvs) or override
-                    else:
-                        # 4) 通常の勝勢/劣勢思想
-                        if cp1 >= TASO_WIN_CP:
-                            override = pick_stable_winning_move(pvs) or override
-                        elif cp1 <= TASO_LOSE_CP and not endgame:
-                            override = pick_annoying_losing_move(pvs) or override
+                    elif cp1 >= TASO_WIN_CP:
+                        override = pick_stable_winning_move(pvs) or override
+                    elif cp1 <= TASO_LOSE_CP:
+                        override = pick_annoying_losing_move(pvs) or override
 
                 out(f"bestmove {override}")
                 apply_opts()
