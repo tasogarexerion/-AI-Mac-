@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-TASO Engine — Hysteresis + HumanScore Decision Layer
-===================================================
+TASO Engine — NNUE USI Wrapper (Stable + No-1move-stop)
 
-USI wrapper for NNUE engines.
-Adds:
-- humanscore-based evaluation
-- hysteresis-based play-mode switching
-- stable / hisshi / annoying personalities
-- reader thread + queue (Windows safe)
+Features:
+- USI compliant
+- Reader thread + queue (stdout deadlock safe)
+- Always drains until bestmove (never exits go-loop early)
+- Safe stop handling (soft timeout -> stop -> keep draining)
+- HumanScore-based hysteresis
+- Mode: neutral / win / lose / hisshi
 
 Decision priority:
-  Short mate (win-only)
-  > Hisshi (latched)
+  Short mate
+  > Hisshi
   > Stable win
   > Annoying loss
 """
@@ -28,20 +28,19 @@ import random
 import re
 import threading
 import queue
-from enum import Enum, auto
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List
 
-# ---------------------------------------------------------
+# =========================================================
 # Engine path
-# ---------------------------------------------------------
+# =========================================================
 ENGINE_EXE = os.environ.get(
     "TASO_ENGINE_EXE",
     r"C:\shogi\engines\nnue_engine\nnue_engine.exe"
 )
 
-# ---------------------------------------------------------
+# =========================================================
 # Environment
-# ---------------------------------------------------------
+# =========================================================
 TASO_SHOW  = os.environ.get("TASO_SHOW",  "1") == "1"
 TASO_DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
 
@@ -49,63 +48,62 @@ TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
 TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
 TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
 
-# ---------------------------------------------------------
-# Evaluation thresholds
-# ---------------------------------------------------------
-TASO_WIN_CP  = int(os.environ.get("TASO_WIN_CP",  "300"))
-TASO_LOSE_CP = int(os.environ.get("TASO_LOSE_CP", "-300"))
-ENDGAME_CP   = int(os.environ.get("TASO_ENDGAME_CP", "800"))
+# =========================================================
+# Thresholds
+# =========================================================
+ENDGAME_CP = int(os.environ.get("TASO_ENDGAME_CP", "800"))
+TASO_SHORT_MATE_MAX = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
 
 TASO_STABLE_DROP    = int(os.environ.get("TASO_STABLE_DROP", "120"))
-TASO_PREFIX_K       = int(os.environ.get("TASO_PREFIX_K", "4"))
 TASO_ANNOY_MAX_DROP = int(os.environ.get("TASO_ANNOY_MAX_DROP", "180"))
+TASO_PREFIX_K       = int(os.environ.get("TASO_PREFIX_K", "4"))
 
-# Mate / hisshi
-TASO_SHORT_MATE_MAX    = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
 TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
 TASO_HISSHI_MAX_DROP   = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
 TASO_HISSHI_MIN_LINES  = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
 
+# =========================================================
+# HumanScore hysteresis
+# =========================================================
+HS_WIN_ENTER  = float(os.environ.get("TASO_HS_WIN_ENTER",  "0.70"))
+HS_WIN_EXIT   = float(os.environ.get("TASO_HS_WIN_EXIT",   "0.62"))
+HS_LOSE_ENTER = float(os.environ.get("TASO_HS_LOSE_ENTER", "0.30"))
+HS_LOSE_EXIT  = float(os.environ.get("TASO_HS_LOSE_EXIT",  "0.38"))
+
+# =========================================================
 # IO safety
+# =========================================================
 READ_TIMEOUT   = float(os.environ.get("TASO_READ_TIMEOUT", "0.5"))
+
+# Soft timeout: after this, we send "stop" once.
 GO_TIMEOUT_SEC = float(os.environ.get("TASO_GO_TIMEOUT", "10.0"))
+
+# Hard fail-safe (seconds after stop) to avoid infinite hang if engine is broken.
+# Still: we will ALWAYS output bestmove (fallback).
+POST_STOP_HARD_TIMEOUT_SEC = float(os.environ.get("TASO_POST_STOP_HARD_TIMEOUT", "20.0"))
+
 LINE_LIMIT     = int(os.environ.get("TASO_LINE_LIMIT", "6000"))
 
-# ---------------------------------------------------------
-# Hysteresis thresholds (HumanScore)
-# ---------------------------------------------------------
-HS_STABLE_ENTER = float(os.environ.get("HS_STABLE_ENTER", "0.60"))
-HS_STABLE_EXIT  = float(os.environ.get("HS_STABLE_EXIT",  "0.55"))
-HS_ANNOY_ENTER  = float(os.environ.get("HS_ANNOY_ENTER",  "0.40"))
-HS_ANNOY_EXIT   = float(os.environ.get("HS_ANNOY_EXIT",   "0.45"))
+# If engine outputs nothing for too long (even before stop), we keep waiting.
+# This prevents "1 move stop". It's just for optional debug info strings.
+SILENCE_INFO_SEC = float(os.environ.get("TASO_SILENCE_INFO_SEC", "5.0"))
 
-# ---------------------------------------------------------
-# Annoy scoring (tweakable constants)
-# ---------------------------------------------------------
-ANNOY_PREF_W = int(os.environ.get("ANNOY_PREF_W", "10"))        # divergence weight
-ANNOY_BONUS_PREF2 = int(os.environ.get("ANNOY_BONUS_PREF2", "40"))
-ANNOY_BONUS_PREF1 = int(os.environ.get("ANNOY_BONUS_PREF1", "18"))
+# =========================================================
+# Utils
+# =========================================================
+_INT_RE = re.compile(r"^-?\d+$")
 
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
 def out(s: str) -> None:
     sys.stdout.write(s + "\n")
     sys.stdout.flush()
-
-def dbg(s: str) -> None:
-    if TASO_DEBUG:
-        sys.stderr.write("[TASO] " + s + "\n")
-        sys.stderr.flush()
 
 def say(s: str) -> None:
     if TASO_SHOW:
         out("info string " + s)
 
-# ---------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------
-_INT_RE = re.compile(r"^-?\d+$")
+def dbg(s: str) -> None:
+    if TASO_DEBUG:
+        out("info string [debug] " + s)
 
 def is_int(s: str) -> bool:
     return bool(_INT_RE.match(s))
@@ -114,10 +112,8 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def human_score(cp: int) -> float:
-    # cp is normalized to "black advantage" by multiplying with `turn`.
     x = cp / 450.0
     h = 1.0 / (1.0 + math.exp(-x))
-    # Endgame compression: avoid overconfidence when eval saturates.
     if abs(cp) >= ENDGAME_CP:
         h = 0.5 + (h - 0.5) * 0.6
     return clamp(h, 0.01, 0.99)
@@ -129,48 +125,25 @@ def common_prefix_len(a: str, b: str, k: int) -> int:
             return i
     return min(k, len(aa), len(bb))
 
-def parse_mate_int(m: Optional[str]) -> Optional[int]:
-    # USI mate can be: integer, "+", "-", "0", etc depending on engine.
-    if m is None:
-        return None
-    if is_int(m):
-        try:
-            return int(m)
-        except Exception:
-            return None
-    return None
-
-# ---------------------------------------------------------
-# Turn detection
-# ---------------------------------------------------------
 def turn_sign_from_position(line: str) -> int:
-    """
-    Returns +1 if side-to-move is black, -1 if white.
-    Used to normalize cp/mate to "black advantage".
-    """
     t = line.split()
-    if len(t) < 2:
-        return 1
-    if t[1] == "startpos":
-        if "moves" in t:
-            c = len(t) - t.index("moves") - 1
-            return 1 if c % 2 == 0 else -1
-        return 1
-    if t[1] == "sfen":
-        # sfen ... b|w ...
-        for x in t[2:]:
+    if "startpos" in t and "moves" in t:
+        c = len(t) - t.index("moves") - 1
+        return 1 if c % 2 == 0 else -1
+    if "sfen" in t:
+        for x in t:
             if x == "b":
                 return 1
             if x == "w":
                 return -1
     return 1
 
-# ---------------------------------------------------------
-# Child engine (reader thread)
-# ---------------------------------------------------------
+# =========================================================
+# Child engine
+# =========================================================
 class ChildEngine:
     def __init__(self, exe: str) -> None:
-        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+        flags = 0x08000000 if os.name == "nt" else 0
         self.proc = subprocess.Popen(
             [exe],
             stdin=subprocess.PIPE,
@@ -180,20 +153,23 @@ class ChildEngine:
             bufsize=1,
             creationflags=flags,
         )
-        self.q: "queue.Queue[str]" = queue.Queue()
-        self.stop = threading.Event()
-        self.t = threading.Thread(target=self._reader, daemon=True)
-        self.t.start()
+        self.q: queue.Queue[str] = queue.Queue()
+        self.stop_evt = threading.Event()
+        self.reader_alive = threading.Event()
+        self.reader_alive.set()
+        threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self) -> None:
         try:
             assert self.proc.stdout is not None
             for line in self.proc.stdout:
-                if self.stop.is_set():
+                if self.stop_evt.is_set():
                     break
                 self.q.put(line.rstrip("\n"))
         except Exception:
             pass
+        finally:
+            self.reader_alive.clear()
 
     def send(self, s: str) -> None:
         try:
@@ -204,7 +180,7 @@ class ChildEngine:
         except Exception:
             pass
 
-    def readline(self, timeout: float) -> Optional[str]:
+    def recv(self, timeout: float) -> Optional[str]:
         try:
             return self.q.get(timeout=timeout)
         except queue.Empty:
@@ -217,19 +193,17 @@ class ChildEngine:
             except queue.Empty:
                 break
 
-    def wait_for(self, prefix: str, timeout_sec: float) -> bool:
-        deadline = time.time() + timeout_sec
-        while time.time() < deadline:
-            r = self.readline(READ_TIMEOUT)
-            if r is None:
-                continue
-            if r.startswith(prefix):
-                return True
+    def poll_dead(self) -> bool:
+        # True if process is dead or reader thread finished.
+        if self.proc.poll() is not None:
+            return True
+        if not self.reader_alive.is_set():
+            return True
         return False
 
     def close(self) -> None:
+        self.stop_evt.set()
         try:
-            self.stop.set()
             self.send("quit")
         except Exception:
             pass
@@ -237,63 +211,46 @@ class ChildEngine:
             self.proc.terminate()
         except Exception:
             pass
-        # Hard-kill fallback
-        try:
-            self.proc.wait(timeout=0.5)
-        except Exception:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
 
-# ---------------------------------------------------------
+# =========================================================
 # PV Store
-# ---------------------------------------------------------
+# =========================================================
 class PVStore:
     def __init__(self) -> None:
         self.move: Dict[int, str] = {}
-        self.cp: Dict[int, int] = {}        # normalized to black advantage
-        self.mate: Dict[int, str] = {}      # raw mate token
+        self.cp: Dict[int, int] = {}
+        self.mate: Dict[int, int] = {}
         self.pv: Dict[int, str] = {}
         self.depth: Dict[int, int] = {}
 
     def reset(self) -> None:
-        self.move.clear()
-        self.cp.clear()
-        self.mate.clear()
-        self.pv.clear()
-        self.depth.clear()
+        self.__init__()
 
-    def snap(self, mpv: int, depth: int, mv: Optional[str], pv: Optional[str],
-             cp: Optional[int], mate: Optional[str]) -> None:
+    def snap(self, mpv: int, depth: int,
+             mv: Optional[str], pv: Optional[str],
+             cp: Optional[int], mate: Optional[int]) -> None:
         if depth < self.depth.get(mpv, -1):
             return
         self.depth[mpv] = depth
-        if mv:
-            self.move[mpv] = mv
-        if pv:
-            self.pv[mpv] = pv
-        if cp is not None:
-            self.cp[mpv] = cp
-        if mate is not None:
-            self.mate[mpv] = mate
+        if mv:   self.move[mpv] = mv
+        if pv:   self.pv[mpv] = pv
+        if cp is not None:   self.cp[mpv] = cp
+        if mate is not None: self.mate[mpv] = mate
 
-# ---------------------------------------------------------
+# =========================================================
 # Heuristics
-# ---------------------------------------------------------
+# =========================================================
 def is_hisshi(pvs: PVStore) -> bool:
-    if 1 not in pvs.pv or 1 not in pvs.cp:
+    if 1 not in pvs.cp or 1 not in pvs.pv:
         return False
-    base_pv, base_cp = pvs.pv[1], pvs.cp[1]
+    base_cp = pvs.cp[1]
+    base_pv = pvs.pv[1]
     hits = 0
     for i in range(2, TASO_MULTIPV + 1):
-        pv, cp = pvs.pv.get(i), pvs.cp.get(i)
-        if not pv or cp is None:
+        if i not in pvs.cp or i not in pvs.pv:
             continue
-        if (
-            common_prefix_len(base_pv, pv, TASO_PREFIX_K) >= TASO_HISSHI_PREFIX_MIN
-            and abs(base_cp - cp) <= TASO_HISSHI_MAX_DROP
-        ):
+        if abs(base_cp - pvs.cp[i]) <= TASO_HISSHI_MAX_DROP \
+           and common_prefix_len(base_pv, pvs.pv[i], TASO_PREFIX_K) >= TASO_HISSHI_PREFIX_MIN:
             hits += 1
     return hits >= TASO_HISSHI_MIN_LINES
 
@@ -303,15 +260,15 @@ def pick_stable(pvs: PVStore) -> Optional[str]:
     best_mv = pvs.move.get(1)
     best_score = -10**9
     for i in range(1, TASO_MULTIPV + 1):
-        mv, cp, pv = pvs.move.get(i), pvs.cp.get(i), pvs.pv.get(i, "")
-        if not mv or cp is None:
+        if i not in pvs.move or i not in pvs.cp:
             continue
-        drop = max(0, base_cp - cp)
+        drop = max(0, base_cp - pvs.cp[i])
         if drop > TASO_STABLE_DROP:
             continue
-        score = -drop + common_prefix_len(base_pv, pv, TASO_PREFIX_K) * 5
+        score = -drop + common_prefix_len(base_pv, pvs.pv.get(i, ""), TASO_PREFIX_K) * 5
         if score > best_score:
-            best_mv, best_score = mv, score
+            best_score = score
+            best_mv = pvs.move[i]
     return best_mv
 
 def pick_annoy(pvs: PVStore) -> Optional[str]:
@@ -320,232 +277,231 @@ def pick_annoy(pvs: PVStore) -> Optional[str]:
     best_score = -10**9
     cand: List[str] = []
     for i in range(2, TASO_MULTIPV + 1):
-        mv, cp, pv = pvs.move.get(i), pvs.cp.get(i), pvs.pv.get(i, "")
-        if not mv or cp is None:
+        if i not in pvs.move or i not in pvs.cp:
             continue
-        drop = base_cp - cp
+        drop = base_cp - pvs.cp[i]
         if drop > TASO_ANNOY_MAX_DROP:
             continue
-        pref = common_prefix_len(base_pv, pv, TASO_PREFIX_K)
-        # Intuition: prefer lines that diverge early, but not too losing.
-        score = (TASO_PREFIX_K - pref) * ANNOY_PREF_W
-        if pref == 2:
-            score += ANNOY_BONUS_PREF2
-        elif pref == 1:
-            score += ANNOY_BONUS_PREF1
+        pref = common_prefix_len(base_pv, pvs.pv.get(i, ""), TASO_PREFIX_K)
+        score = (TASO_PREFIX_K - pref) * 10
+        if pref == 2: score += 40
+        if pref == 1: score += 18
         if score > best_score:
             best_score = score
-            cand = [mv]
+            cand = [pvs.move[i]]
         elif score == best_score:
-            cand.append(mv)
+            cand.append(pvs.move[i])
     return random.choice(cand) if cand else pvs.move.get(1)
 
-# ---------------------------------------------------------
-# PlayMode (hysteresis + strategy dispatch)
-# ---------------------------------------------------------
-class PlayMode(Enum):
-    UNKNOWN = auto()
-    STABLE  = auto()
-    HISSHI  = auto()
-    ANNOY   = auto()
-
-    def select_move(self, pvs: PVStore, fallback: str) -> str:
-        if self == PlayMode.HISSHI:
-            say("🔒 hisshi mode")
-            return pick_stable(pvs) or fallback
-        if self == PlayMode.STABLE:
-            say("🧱 stable mode")
-            return pick_stable(pvs) or fallback
-        if self == PlayMode.ANNOY:
-            say("🪤 annoy mode")
-            return pick_annoy(pvs) or fallback
-        return fallback
-
-def update_play_mode(prev: PlayMode, hs: float, hisshi: bool) -> PlayMode:
-    if hisshi:
-        return PlayMode.HISSHI
-
-    if prev == PlayMode.STABLE:
-        return PlayMode.STABLE if hs >= HS_STABLE_EXIT else PlayMode.UNKNOWN
-
-    if prev == PlayMode.ANNOY:
-        return PlayMode.ANNOY if hs <= HS_ANNOY_EXIT else PlayMode.UNKNOWN
-
-    if hs >= HS_STABLE_ENTER:
-        return PlayMode.STABLE
-    if hs <= HS_ANNOY_ENTER:
-        return PlayMode.ANNOY
-
-    return prev
-
-# ---------------------------------------------------------
-# Main USI loop
-# ---------------------------------------------------------
+# =========================================================
+# Main loop
+# =========================================================
 def main() -> None:
-    if not os.path.isfile(ENGINE_EXE):
-        out("id name TASO (engine missing)")
-        out("id author taso")
-        out("usiok")
-        return
-
     eng = ChildEngine(ENGINE_EXE)
     pvs = PVStore()
-    play_mode = PlayMode.UNKNOWN
     turn = 1
     last_pos = "position startpos"
-    opts_sent = False
+    mode = "neutral"
 
-    def apply_opts() -> None:
-        # Send options repeatedly is usually safe; but avoid spamming unless needed.
+    def apply_opts():
         eng.send(f"setoption name Threads value {TASO_THREADS}")
         eng.send(f"setoption name Hash value {TASO_HASH_MB}")
         eng.send(f"setoption name MultiPV value {TASO_MULTIPV}")
 
-    try:
-        for raw in sys.stdin:
-            line = raw.strip()
-            if not line:
+    def wait_for(token: str, timeout_sec: float) -> bool:
+        """Drain child output until a line startswith token, or until timeout."""
+        t0 = time.time()
+        while True:
+            if eng.poll_dead():
+                return False
+            if time.time() - t0 > timeout_sec:
+                return False
+            r = eng.recv(READ_TIMEOUT)
+            if r is None:
                 continue
+            out(r)
+            if r.startswith(token):
+                return True
 
-            if line == "usi":
-                # Handshake with child.
-                eng.flush()
-                eng.send("usi")
-                eng.wait_for("usiok", timeout_sec=2.0)
-                apply_opts()
-                opts_sent = True
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
 
-                out("id name TASO (Hysteresis)")
-                out("id author taso")
-                out("usiok")
-                continue
+        if line == "usi":
+            eng.flush()
+            eng.send("usi")
 
-            if line == "isready":
-                # Ensure child is ready as well; GUI expects correct timing.
-                if opts_sent:
-                    apply_opts()
-                eng.send("isready")
-                eng.wait_for("readyok", timeout_sec=2.0)
-                out("readyok")
-                continue
+            # forward child's usi lines fully until usiok
+            while True:
+                if eng.poll_dead():
+                    break
+                r = eng.recv(READ_TIMEOUT)
+                if r is None:
+                    continue
+                # pass-through except we can skip child's id if desired
+                if r.startswith("id"):
+                    continue
+                out(r)
+                if r.startswith("usiok"):
+                    break
 
-            if line.startswith("position"):
-                last_pos = line
-                turn = turn_sign_from_position(line)
-                eng.send(line)
-                continue
+            out("id name TASO (Stable Wrapper + NoStop)")
+            out("id author taso")
+            out("usiok")
+            apply_opts()
+            continue
 
-            if line.startswith("go"):
-                pvs.reset()
-                eng.flush()
-                eng.send(last_pos)
-                eng.send(line)
+        if line == "isready":
+            # Important: flush so we don't accidentally consume an old readyok
+            eng.flush()
+            eng.send("isready")
 
-                best_engine = None
-                start = time.time()
+            # MUST reply readyok. Keep waiting until we see it or engine dies.
+            while True:
+                if eng.poll_dead():
+                    # Engine died; still must answer something USI-compliant.
+                    out("readyok")
+                    break
+                r = eng.recv(READ_TIMEOUT)
+                if r is None:
+                    continue
+                if r.startswith("readyok"):
+                    out("readyok")
+                    break
+                # Some engines may output info during isready; forward it.
+                if r.startswith("info"):
+                    out(r)
+            continue
 
-                for _ in range(LINE_LIMIT):
-                    if time.time() - start > GO_TIMEOUT_SEC:
-                        eng.send("stop")
-                        break
-                    m = eng.readline(READ_TIMEOUT)
-                    if m is None:
-                        continue
+        if line.startswith("position"):
+            last_pos = line
+            turn = turn_sign_from_position(line)
+            eng.send(line)
+            continue
 
-                    if m.startswith("info"):
-                        out(m)
-                        t = m.split()
+        if line.startswith("go"):
+            pvs.reset()
 
-                        mpv = 1
-                        if "multipv" in t:
-                            try:
-                                mpv = int(t[t.index("multipv") + 1])
-                            except Exception:
-                                mpv = 1
+            # Hard separation from previous search output
+            eng.flush()
 
-                        depth = 0
-                        if "depth" in t:
-                            try:
-                                depth = int(t[t.index("depth") + 1])
-                            except Exception:
-                                depth = 0
-
-                        cp: Optional[int] = None
-                        if "cp" in t:
-                            i = t.index("cp")
-                            if i + 1 < len(t) and is_int(t[i + 1]):
-                                # Normalize to black advantage.
-                                cp = int(t[i + 1]) * turn
-
-                        mate: Optional[str] = None
-                        if "mate" in t:
-                            i = t.index("mate")
-                            if i + 1 < len(t):
-                                mate = t[i + 1]
-
-                        mv: Optional[str] = None
-                        pv: Optional[str] = None
-                        if "pv" in t:
-                            i = t.index("pv")
-                            if i + 1 < len(t):
-                                pv = " ".join(t[i + 1:])
-                                mv = t[i + 1]
-
-                        pvs.snap(mpv, depth, mv, pv, cp, mate)
-                        continue
-
-                    if m.startswith("bestmove"):
-                        sp = m.split()
-                        best_engine = sp[1] if len(sp) >= 2 else None
-                        break
-
-                cp1 = pvs.cp.get(1, 0)
-                hs = human_score(cp1)
-                out(f"info string humanscore={hs:.2f}")
-
-                hisshi = is_hisshi(pvs)
-                play_mode = update_play_mode(play_mode, hs, hisshi)
-
-                fallback = best_engine or "resign"
-
-                # ---- Short mate (win-only) ----
-                # Normalize mate to black advantage by multiplying with `turn`.
-                best_mate_len: Optional[int] = None
-                best_mate_mv: Optional[str] = None
-                for i, mate_tok in pvs.mate.items():
-                    mt = parse_mate_int(mate_tok)
-                    if mt is None:
-                        continue
-                    # mt > 0 usually means "side to move mates in mt".
-                    # Normalize so positive means "black mates".
-                    mt_norm = mt * turn
-                    if mt_norm <= 0:
-                        continue  # ignore losing mates and non-winning signals here
-                    mv = pvs.move.get(i)
-                    if not mv:
-                        continue
-                    if best_mate_len is None or mt_norm < best_mate_len:
-                        best_mate_len = mt_norm
-                        best_mate_mv = mv
-
-                override = fallback
-                if best_mate_len is not None and best_mate_len <= TASO_SHORT_MATE_MAX:
-                    say(f"⚡ short mate {best_mate_len}")
-                    override = best_mate_mv or override
-                else:
-                    override = play_mode.select_move(pvs, fallback)
-
-                out(f"bestmove {override}")
-                continue
-
-            if line == "quit":
-                break
-
-            # passthrough
+            # Ensure correct position is set right before go
+            eng.send(last_pos)
             eng.send(line)
 
-    finally:
-        eng.close()
+            best_engine: Optional[str] = None
+            start = time.time()
+            stop_sent_at: Optional[float] = None
+            last_any_output = time.time()
+
+            # --- 핵심: bestmove を受け取るまで絶対に抜けない ---
+            while True:
+                if eng.poll_dead():
+                    dbg("engine dead during go-loop")
+                    break
+
+                now = time.time()
+
+                # If engine is silent for too long, optionally emit a heartbeat.
+                if now - last_any_output > SILENCE_INFO_SEC:
+                    dbg(f"waiting... silent={now-last_any_output:.1f}s")
+                    last_any_output = now  # avoid spam
+
+                # Soft timeout -> send stop once
+                if stop_sent_at is None and (now - start) > GO_TIMEOUT_SEC:
+                    eng.send("stop")
+                    stop_sent_at = time.time()
+                    dbg("stop sent (soft timeout)")
+
+                # Hard fail-safe after stop: if still nothing, we will break and fallback
+                if stop_sent_at is not None and (now - stop_sent_at) > POST_STOP_HARD_TIMEOUT_SEC:
+                    dbg("hard timeout after stop; fallback bestmove")
+                    break
+
+                r = eng.recv(READ_TIMEOUT)
+                if r is None:
+                    # IMPORTANT: NEVER break here. keep waiting.
+                    continue
+
+                last_any_output = time.time()
+
+                if r.startswith("info"):
+                    out(r)
+                    t = r.split()
+                    mpv = int(t[t.index("multipv")+1]) if "multipv" in t else 1
+                    depth = int(t[t.index("depth")+1]) if "depth" in t else 0
+                    cp = None
+                    mate = None
+                    if "cp" in t:
+                        i = t.index("cp")
+                        if i + 1 < len(t) and is_int(t[i+1]):
+                            cp = int(t[i+1]) * turn
+                    if "mate" in t:
+                        i = t.index("mate")
+                        if i + 1 < len(t) and is_int(t[i+1]):
+                            mate = int(t[i+1]) * turn
+                    if "pv" in t:
+                        i = t.index("pv")
+                        if i + 1 < len(t):
+                            mv = t[i+1]
+                            pv = " ".join(t[i+1:])
+                        else:
+                            mv = pv = None
+                    else:
+                        mv = pv = None
+                    pvs.snap(mpv, depth, mv, pv, cp, mate)
+                    continue
+
+                if r.startswith("bestmove"):
+                    sp = r.split()
+                    if len(sp) >= 2:
+                        best_engine = sp[1]
+                    else:
+                        best_engine = None
+                    break
+
+                # Pass-through anything else (rare but harmless)
+                out(r)
+
+            # If engine died or timed out hard, choose fallback base move:
+            override = best_engine or pvs.move.get(1) or "resign"
+
+            # humanscore + mode hysteresis
+            cp1 = pvs.cp.get(1, 0)
+            hs = human_score(cp1)
+            out(f"info string humanscore={hs:.2f}")
+
+            if mode == "neutral":
+                if hs >= HS_WIN_ENTER:
+                    mode = "win"
+                elif hs <= HS_LOSE_ENTER:
+                    mode = "lose"
+            elif mode == "win" and hs <= HS_WIN_EXIT:
+                mode = "neutral"
+            elif mode == "lose" and hs >= HS_LOSE_EXIT:
+                mode = "neutral"
+
+            # Decision priority:
+            best_mate = min((m for m in pvs.mate.values() if m > 0), default=None)
+            if best_mate is not None and best_mate <= TASO_SHORT_MATE_MAX:
+                override = pvs.move.get(1, override)
+            elif is_hisshi(pvs):
+                override = pick_stable(pvs) or override
+            elif mode == "win":
+                override = pick_stable(pvs) or override
+            elif mode == "lose":
+                override = pick_annoy(pvs) or override
+
+            out(f"bestmove {override}")
+            continue
+
+        if line == "quit":
+            break
+
+        eng.send(line)
+
+    eng.close()
 
 if __name__ == "__main__":
     main()
