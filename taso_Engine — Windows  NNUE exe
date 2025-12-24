@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import subprocess
+import time
+import math
+import random
+import re
+import threading
+import queue
+from typing import Dict, Optional, List
+
+# =========================================================
+# TASO Engine — Windows / NNUE exe
+#
+# Philosophy:
+# - Direct NNUE .exe launch (no bash / sh)
+# - USI compliant / GUI-safe
+# - Windows stdout deadlock safe (reader thread)
+# - Always emits humanscore + bestmove exactly once
+#
+# Move priority:
+#   Short mate > Hisshi > Stable win > Annoying loss
+# =========================================================
+
+# ---------------------------------------------------------
+# Engine path
+# ---------------------------------------------------------
+ENGINE_EXE = os.environ.get(
+    "TASO_ENGINE_EXE",
+    r"C:\shogi\engines\nnue_engine\nnue_engine.exe"
+)
+
+# ---------------------------------------------------------
+# Environment
+# ---------------------------------------------------------
+TASO_SHOW  = os.environ.get("TASO_SHOW",  "1") == "1"
+TASO_DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
+
+TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
+TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
+TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
+
+# ---------------------------------------------------------
+# Evaluation thresholds
+# ---------------------------------------------------------
+TASO_WIN_CP  = int(os.environ.get("TASO_WIN_CP",  "300"))
+TASO_LOSE_CP = int(os.environ.get("TASO_LOSE_CP", "-300"))
+ENDGAME_CP   = int(os.environ.get("TASO_ENDGAME_CP", "800"))
+
+TASO_STABLE_DROP     = int(os.environ.get("TASO_STABLE_DROP", "120"))
+TASO_PREFIX_K        = int(os.environ.get("TASO_PREFIX_K", "4"))
+TASO_ANNOY_MAX_DROP  = int(os.environ.get("TASO_ANNOY_MAX_DROP", "180"))
+
+TASO_SHORT_MATE_MAX    = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
+TASO_LONG_MATE_IGNORE  = int(os.environ.get("TASO_LONG_MATE_IGNORE", "10"))
+TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
+TASO_HISSHI_MAX_DROP   = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
+TASO_HISSHI_MIN_LINES  = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
+
+# ---------------------------------------------------------
+# IO safety
+# ---------------------------------------------------------
+READ_TIMEOUT   = float(os.environ.get("TASO_READ_TIMEOUT", "0.5"))
+GO_TIMEOUT_SEC = float(os.environ.get("TASO_GO_TIMEOUT", "10.0"))
+LINE_LIMIT     = int(os.environ.get("TASO_LINE_LIMIT", "6000"))
+
+# ---------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------
+_INT_RE = re.compile(r"^-?\d+$")
+
+def out(s: str) -> None:
+    sys.stdout.write(s + "\n")
+    sys.stdout.flush()
+
+def dbg(s: str) -> None:
+    if TASO_DEBUG:
+        sys.stderr.write("[TASO] " + s + "\n")
+        sys.stderr.flush()
+
+def say(s: str) -> None:
+    if TASO_SHOW:
+        out("info string " + s)
+
+def is_int(s: str) -> bool:
+    return bool(_INT_RE.match(s))
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def human_score(cp: int) -> float:
+    x = cp / 450.0
+    h = 1.0 / (1.0 + math.exp(-x))
+    if abs(cp) >= ENDGAME_CP:
+        h = 0.5 + (h - 0.5) * 0.6
+    return clamp(h, 0.01, 0.99)
+
+def ensure_humanscore(sent: bool, cp: int) -> None:
+    if not sent:
+        out(f"info string humanscore={human_score(cp):.2f}")
+
+def common_prefix_len(a: str, b: str, k: int) -> int:
+    aa, bb = a.split(), b.split()
+    for i in range(min(k, len(aa), len(bb))):
+        if aa[i] != bb[i]:
+            return i
+    return min(k, len(aa), len(bb))
+
+def parse_mate(m: Optional[str]) -> Optional[int]:
+    try:
+        return int(m) if m is not None else None
+    except Exception:
+        return None
+
+# ---------------------------------------------------------
+# Turn detection
+# ---------------------------------------------------------
+def turn_sign_from_position(line: str) -> int:
+    tokens = line.split()
+    if len(tokens) < 2:
+        return 1
+
+    if tokens[1] == "startpos":
+        if "moves" in tokens:
+            move_count = len(tokens) - tokens.index("moves") - 1
+            return 1 if move_count % 2 == 0 else -1
+        return 1
+
+    if tokens[1] == "sfen":
+        for t in tokens[2:]:
+            if t == "b":
+                return 1
+            if t == "w":
+                return -1
+
+    return 1
+
+# ---------------------------------------------------------
+# Child Engine (Windows-safe stdout)
+# ---------------------------------------------------------
+class ChildEngine:
+    def __init__(self, exe: str) -> None:
+        flags = 0x08000000 if os.name == "nt" else 0
+        self.proc = subprocess.Popen(
+            [exe],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            creationflags=flags,
+        )
+
+        self.queue: "queue.Queue[str]" = queue.Queue()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self) -> None:
+        try:
+            assert self.proc.stdout
+            for line in self.proc.stdout:
+                if self.stop_event.is_set():
+                    break
+                self.queue.put(line.rstrip("\n"))
+        except Exception:
+            pass
+
+    def send(self, s: str) -> None:
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.write(s + "\n")
+                self.proc.stdin.flush()
+        except Exception:
+            pass
+
+    def readline(self, timeout: float) -> Optional[str]:
+        try:
+            return self.queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def flush(self) -> None:
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def close(self) -> None:
+        try:
+            self.stop_event.set()
+            self.send("quit")
+            self.proc.terminate()
+        except Exception:
+            pass
+
+# ---------------------------------------------------------
+# PV Store
+# ---------------------------------------------------------
+class PVStore:
+    def __init__(self) -> None:
+        self.move: Dict[int, str] = {}
+        self.cp: Dict[int, int] = {}
+        self.mate: Dict[int, str] = {}
+        self.pv: Dict[int, str] = {}
+        self.depth: Dict[int, int] = {}
+
+    def reset(self) -> None:
+        self.move.clear()
+        self.cp.clear()
+        self.mate.clear()
+        self.pv.clear()
+        self.depth.clear()
+
+    def snap(
+        self,
+        multipv: int,
+        depth: int,
+        move: Optional[str],
+        pv: Optional[str],
+        cp: Optional[int],
+        mate: Optional[str],
+    ) -> None:
+        if depth < self.depth.get(multipv, -1):
+            return
+        self.depth[multipv] = depth
+        if move:
+            self.move[multipv] = move
+        if pv:
+            self.pv[multipv] = pv
+        if cp is not None:
+            self.cp[multipv] = cp
+        if mate:
+            self.mate[multipv] = mate
+
+# ---------------------------------------------------------
+# Heuristics
+# ---------------------------------------------------------
+def is_hisshi(pvs: PVStore) -> bool:
+    if 1 not in pvs.pv or 1 not in pvs.cp:
+        return False
+
+    base_pv, base_cp = pvs.pv[1], pvs.cp[1]
+    hits = 0
+
+    for i in range(2, TASO_MULTIPV + 1):
+        pv, cp = pvs.pv.get(i), pvs.cp.get(i)
+        if not pv or cp is None:
+            continue
+        if (
+            common_prefix_len(base_pv, pv, TASO_PREFIX_K) >= TASO_HISSHI_PREFIX_MIN
+            and abs(base_cp - cp) <= TASO_HISSHI_MAX_DROP
+        ):
+            hits += 1
+
+    return hits >= TASO_HISSHI_MIN_LINES
+
+def pick_stable(pvs: PVStore) -> Optional[str]:
+    base_cp = pvs.cp.get(1, 0)
+    base_pv = pvs.pv.get(1, "")
+    best, best_score = pvs.move.get(1), -10**9
+
+    for i in range(1, TASO_MULTIPV + 1):
+        mv, cp, pv = pvs.move.get(i), pvs.cp.get(i), pvs.pv.get(i, "")
+        if not mv or cp is None:
+            continue
+
+        drop = max(0, base_cp - cp)
+        if drop > TASO_STABLE_DROP:
+            continue
+
+        score = -drop + common_prefix_len(base_pv, pv, TASO_PREFIX_K) * 5
+        if score > best_score:
+            best, best_score = mv, score
+
+    return best
+
+def pick_annoy(pvs: PVStore) -> Optional[str]:
+    base_cp = pvs.cp.get(1, 0)
+    base_pv = pvs.pv.get(1, "")
+    best_score, candidates = -10**9, []
+
+    for i in range(2, TASO_MULTIPV + 1):
+        mv, cp, pv = pvs.move.get(i), pvs.cp.get(i), pvs.pv.get(i, "")
+        if not mv or cp is None:
+            continue
+
+        drop = base_cp - cp
+        if drop > TASO_ANNOY_MAX_DROP:
+            continue
+
+        pref = common_prefix_len(base_pv, pv, TASO_PREFIX_K)
+        score = (TASO_PREFIX_K - pref) * 10
+        if pref == 2:
+            score += 40
+        elif pref == 1:
+            score += 18
+
+        if score > best_score:
+            best_score, candidates = score, [mv]
+        elif score == best_score:
+            candidates.append(mv)
+
+    return random.choice(candidates) if candidates else pvs.move.get(1)
+
+# ---------------------------------------------------------
+# Main USI loop
+# ---------------------------------------------------------
+def main() -> None:
+    if not os.path.isfile(ENGINE_EXE):
+        out("id name TASO (engine missing)")
+        out("id author taso")
+        out("usiok")
+        return
+
+    engine = ChildEngine(ENGINE_EXE)
+    pvs = PVStore()
+    turn = 1
+    last_position = "position startpos"
+
+    def apply_options() -> None:
+        engine.send(f"setoption name Threads value {TASO_THREADS}")
+        engine.send(f"setoption name USI_Hash value {TASO_HASH_MB}")
+        engine.send(f"setoption name Hash value {TASO_HASH_MB}")
+        engine.send(f"setoption name MultiPV value {TASO_MULTIPV}")
+
+    try:
+        for raw in sys.stdin:
+            line = raw.strip()
+            if not line:
+                continue
+
+            if line == "usi":
+                out("id name TASO (Windows NNUE Engine)")
+                out("id author taso")
+                out("usiok")
+                engine.send("usi")
+                apply_options()
+                continue
+
+            if line == "isready":
+                engine.send("isready")
+                out("readyok")
+                continue
+
+            if line.startswith("setoption"):
+                engine.send(line)
+                continue
+
+            if line.startswith("position"):
+                last_position = line
+                turn = turn_sign_from_position(line)
+                engine.send(line)
+                continue
+
+            if line.startswith("go"):
+                pvs.reset()
+                engine.flush()
+                engine.send(last_position)
+                engine.send(line)
+
+                best_engine = None
+                humanscore_sent = False
+                start = time.time()
+
+                for _ in range(LINE_LIMIT):
+                    if time.time() - start > GO_TIMEOUT_SEC:
+                        engine.send("stop")
+                        break
+
+                    msg = engine.readline(READ_TIMEOUT)
+                    if msg is None:
+                        continue
+
+                    if msg.startswith("info"):
+                        out(msg)
+                        if "humanscore" in msg:
+                            humanscore_sent = True
+
+                        tokens = msg.split()
+                        multipv = int(tokens[tokens.index("multipv")+1]) if "multipv" in tokens else 1
+                        depth = int(tokens[tokens.index("depth")+1]) if "depth" in tokens else 0
+
+                        cp = None
+                        if "cp" in tokens:
+                            i = tokens.index("cp")
+                            if i+1 < len(tokens) and is_int(tokens[i+1]):
+                                cp = int(tokens[i+1]) * turn
+
+                        mate = tokens[tokens.index("mate")+1] if "mate" in tokens else None
+
+                        move = pv = None
+                        if "pv" in tokens:
+                            i = tokens.index("pv")
+                            pv = " ".join(tokens[i+1:])
+                            move = tokens[i+1]
+
+                        pvs.snap(multipv, depth, move, pv, cp, mate)
+                        continue
+
+                    if msg.startswith("bestmove"):
+                        best_engine = msg.split()[1]
+                        break
+
+                cp1 = pvs.cp.get(1, 0)
+                ensure_humanscore(humanscore_sent, cp1)
+
+                override = best_engine or "resign"
+
+                # Short mate priority
+                best_len, best_mv = None, None
+                for i, m in pvs.mate.items():
+                    mt = parse_mate(m)
+                    if mt and (best_len is None or mt < best_len):
+                        best_len, best_mv = mt, pvs.move.get(i)
+
+                if best_len is not None and best_len <= TASO_SHORT_MATE_MAX:
+                    override = best_mv or override
+                elif is_hisshi(pvs):
+                    override = pick_stable(pvs) or override
+                elif cp1 >= TASO_WIN_CP:
+                    override = pick_stable(pvs) or override
+                elif cp1 <= TASO_LOSE_CP:
+                    override = pick_annoy(pvs) or override
+
+                out(f"bestmove {override}")
+                apply_options()
+                continue
+
+            if line == "quit":
+                break
+
+            engine.send(line)
+
+    finally:
+        engine.close()
+
+if __name__ == "__main__":
+    main()
