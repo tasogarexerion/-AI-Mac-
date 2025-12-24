@@ -8,21 +8,27 @@ import time
 import math
 import random
 import re
+import threading
+import queue
 from typing import Dict, Optional, List, Tuple
 
 # =========================================================
-# TASO Engine (Python) — FUKAURAOU ONLY / 配布用凍結版
+# TASO Engine (Python) — FUKAURAOU ONLY
 #
-# 修正履歴:
-#  1) readline安全化（疑似タイムアウト事故防止）
-#  2) Hash option 多重送信（NNUE互換性向上）
-#  3) mate / 必至判断を info string で明示
+# Distribution FINAL (SAFE I/O VERSION)
+#
+# - USI compliant / GUI-safe
+# - ReaderThread + Queue (no stdout deadlock)
+# - Hash option multi-send (NNUE compatibility)
+# - HumanScore hysteresis for style stability
+# - ALWAYS emits bestmove
 # =========================================================
 
-# --------------------------
-# env / paths
-# --------------------------
-TASO_SHOW = os.environ.get("TASO_SHOW", "1") == "1"
+
+# ---------------------------------------------------------
+# Environment / paths
+# ---------------------------------------------------------
+TASO_SHOW  = os.environ.get("TASO_SHOW",  "1") == "1"
 TASO_DEBUG = os.environ.get("TASO_DEBUG", "0") == "1"
 
 FUKA_BIN = os.environ.get(
@@ -34,42 +40,47 @@ TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
 TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
 TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
 
-# thresholds
-TASO_WIN_CP = int(os.environ.get("TASO_WIN_CP", "300"))
+
+# ---------------------------------------------------------
+# Evaluation thresholds (cp)
+# ---------------------------------------------------------
+TASO_WIN_CP  = int(os.environ.get("TASO_WIN_CP",  "300"))
 TASO_LOSE_CP = int(os.environ.get("TASO_LOSE_CP", "-300"))
-ENDGAME_CP = int(os.environ.get("TASO_ENDGAME_CP", "800"))
+ENDGAME_CP   = int(os.environ.get("TASO_ENDGAME_CP", "800"))
 
-# stable selector
-TASO_STABLE_DROP = int(os.environ.get("TASO_STABLE_DROP", "120"))
-TASO_PREFIX_K = int(os.environ.get("TASO_PREFIX_K", "4"))
-
-# annoying selector
+TASO_STABLE_DROP    = int(os.environ.get("TASO_STABLE_DROP", "120"))
+TASO_PREFIX_K       = int(os.environ.get("TASO_PREFIX_K", "4"))
 TASO_ANNOY_MAX_DROP = int(os.environ.get("TASO_ANNOY_MAX_DROP", "180"))
 
-# evil knobs
-TASO_EVIL_EARLY_DIVERGE_W = int(os.environ.get("TASO_EVIL_EARLY_DIVERGE_W", "10"))
-TASO_EVIL_FAKE_CONV_BONUS = int(os.environ.get("TASO_EVIL_FAKE_CONV_BONUS", "18"))
-TASO_EVIL_TWOPLY_BONUS = int(os.environ.get("TASO_EVIL_TWOPLY_BONUS", "40"))
-TASO_EVIL_LONGPREFIX_PENALTY = int(os.environ.get("TASO_EVIL_LONGPREFIX_PENALTY", "12"))
-TASO_EVIL_MID_DROP_BONUS = int(os.environ.get("TASO_EVIL_MID_DROP_BONUS", "10"))
-TASO_EVIL_MID_DROP_MIN = int(os.environ.get("TASO_EVIL_MID_DROP_MIN", "40"))
-TASO_EVIL_MID_DROP_MAX = int(os.environ.get("TASO_EVIL_MID_DROP_MAX", "120"))
-
-# hisshi
-TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
-TASO_HISSHI_MAX_DROP = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
-TASO_HISSHI_MIN_LINES = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
-
-# mate handling
-TASO_SHORT_MATE_MAX = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
+# Mate / hisshi
+TASO_SHORT_MATE_MAX   = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
 TASO_LONG_MATE_IGNORE = int(os.environ.get("TASO_LONG_MATE_IGNORE", "10"))
 
-READ_TIMEOUT_SEC = float(os.environ.get("TASO_READ_TIMEOUT", "2.0"))
-LINE_LIMIT = int(os.environ.get("TASO_LINE_LIMIT", "6000"))
+TASO_HISSHI_PREFIX_MIN = int(os.environ.get("TASO_HISSHI_PREFIX_MIN", "2"))
+TASO_HISSHI_MAX_DROP   = int(os.environ.get("TASO_HISSHI_MAX_DROP", "120"))
+TASO_HISSHI_MIN_LINES  = int(os.environ.get("TASO_HISSHI_MIN_LINES", "2"))
 
-# --------------------------
-# io helpers
-# --------------------------
+READ_TIMEOUT_SEC = float(os.environ.get("TASO_READ_TIMEOUT", "2.0"))
+LINE_LIMIT       = int(os.environ.get("TASO_LINE_LIMIT", "6000"))
+
+
+# ---------------------------------------------------------
+# HumanScore hysteresis thresholds
+# ---------------------------------------------------------
+HS_STABLE_ENTER = float(os.environ.get("TASO_HS_STABLE_ENTER", "0.65"))
+HS_STABLE_EXIT  = float(os.environ.get("TASO_HS_STABLE_EXIT",  "0.60"))
+
+HS_ANNOY_ENTER  = float(os.environ.get("TASO_HS_ANNOY_ENTER",  "0.40"))
+HS_ANNOY_EXIT   = float(os.environ.get("TASO_HS_ANNOY_EXIT",   "0.45"))
+
+MODE_NORMAL = "NORMAL"
+MODE_STABLE = "STABLE"
+MODE_ANNOY  = "ANNOY"
+
+
+# ---------------------------------------------------------
+# IO helpers
+# ---------------------------------------------------------
 def out(s: str) -> None:
     sys.stdout.write(s + "\n")
     sys.stdout.flush()
@@ -83,13 +94,14 @@ def say(s: str) -> None:
     if TASO_SHOW:
         out("info string " + s)
 
-# --------------------------
-# helpers
-# --------------------------
-_re_int = re.compile(r"^-?\d+$")
+
+# ---------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------
+_INT_RE = re.compile(r"^-?\d+$")
 
 def is_int(s: str) -> bool:
-    return bool(_re_int.match(s))
+    return bool(_INT_RE.match(s))
 
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
@@ -102,17 +114,17 @@ def human_score(cp: int) -> float:
     return clamp(h, 0.01, 0.99)
 
 def common_prefix_len(a: str, b: str, k: int) -> int:
-    aa = a.split()
-    bb = b.split()
-    lim = min(k, len(aa), len(bb))
-    for i in range(lim):
+    aa, bb = a.split(), b.split()
+    for i in range(min(k, len(aa), len(bb))):
         if aa[i] != bb[i]:
             return i
-    return lim
+    return min(k, len(aa), len(bb))
 
 def parse_mate(m: Optional[str]) -> Optional[int]:
+    if m is None:
+        return None
     try:
-        return int(m) if m is not None else None
+        return int(m)
     except Exception:
         return None
 
@@ -122,16 +134,37 @@ def turn_sign_from_position(line: str) -> int:
         mc = len(toks) - toks.index("moves") - 1
         return 1 if mc % 2 == 0 else -1
     if "sfen" in toks:
-        for t in toks:
-            if t == "b":
-                return 1
-            if t == "w":
-                return -1
+        i = toks.index("sfen")
+        if len(toks) > i + 2:
+            return 1 if toks[i+2] == "b" else -1
     return 1
 
-# --------------------------
-# child engine (修正①)
-# --------------------------
+
+# ---------------------------------------------------------
+# HumanScore hysteresis state
+# ---------------------------------------------------------
+class HysteresisState:
+    def __init__(self) -> None:
+        self.mode = MODE_NORMAL
+
+    def update(self, hs: float) -> str:
+        if self.mode == MODE_NORMAL:
+            if hs >= HS_STABLE_ENTER:
+                self.mode = MODE_STABLE
+            elif hs <= HS_ANNOY_ENTER:
+                self.mode = MODE_ANNOY
+        elif self.mode == MODE_STABLE:
+            if hs <= HS_STABLE_EXIT:
+                self.mode = MODE_NORMAL
+        elif self.mode == MODE_ANNOY:
+            if hs >= HS_ANNOY_EXIT:
+                self.mode = MODE_NORMAL
+        return self.mode
+
+
+# ---------------------------------------------------------
+# Child engine (ReaderThread safe)
+# ---------------------------------------------------------
 class ChildEngine:
     def __init__(self, cmd: List[str]) -> None:
         self.proc = subprocess.Popen(
@@ -142,27 +175,30 @@ class ChildEngine:
             text=True,
             bufsize=1,
         )
+        self.q: queue.Queue[str] = queue.Queue()
+        self.alive = True
+        self.t = threading.Thread(target=self._reader, daemon=True)
+        self.t.start()
+
+    def _reader(self) -> None:
+        assert self.proc.stdout
+        for line in self.proc.stdout:
+            self.q.put(line.rstrip("\n"))
+        self.alive = False
 
     def send(self, s: str) -> None:
-        try:
-            if self.proc.stdin:
+        if self.proc.stdin:
+            try:
                 self.proc.stdin.write(s + "\n")
                 self.proc.stdin.flush()
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-    def readline(self, timeout: float) -> Optional[str]:
-        if not self.proc.stdout:
+    def recv(self, timeout: float) -> Optional[str]:
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
             return None
-        start = time.time()
-        while True:
-            if time.time() - start > timeout:
-                return None
-            if self.proc.poll() is not None:
-                return None
-            line = self.proc.stdout.readline()
-            if line:
-                return line.rstrip("\n")
 
     def close(self) -> None:
         try:
@@ -174,9 +210,10 @@ class ChildEngine:
         except Exception:
             pass
 
-# --------------------------
+
+# ---------------------------------------------------------
 # PV store
-# --------------------------
+# ---------------------------------------------------------
 class PVStore:
     def __init__(self) -> None:
         self.move: Dict[int, str] = {}
@@ -204,12 +241,13 @@ class PVStore:
             self.pvline[mpv] = pv
         if cp is not None:
             self.cp[mpv] = cp
-        if mate:
+        if mate is not None:
             self.mate[mpv] = mate
 
-# --------------------------
-# 必至検出
-# --------------------------
+
+# ---------------------------------------------------------
+# Hisshi detection
+# ---------------------------------------------------------
 def is_hisshi_position(pvs: PVStore) -> bool:
     if 1 not in pvs.pvline or 1 not in pvs.cp:
         return False
@@ -221,15 +259,15 @@ def is_hisshi_position(pvs: PVStore) -> bool:
         cp = pvs.cp.get(i)
         if not pv or cp is None:
             continue
-        pref = common_prefix_len(pv1, pv, TASO_PREFIX_K)
-        drop = abs(cp1 - cp)
-        if pref >= TASO_HISSHI_PREFIX_MIN and drop <= TASO_HISSHI_MAX_DROP:
+        if common_prefix_len(pv1, pv, TASO_PREFIX_K) >= TASO_HISSHI_PREFIX_MIN \
+           and abs(cp1 - cp) <= TASO_HISSHI_MAX_DROP:
             hits += 1
     return hits >= TASO_HISSHI_MIN_LINES
 
-# --------------------------
-# move selection
-# --------------------------
+
+# ---------------------------------------------------------
+# Move selection
+# ---------------------------------------------------------
 def pick_stable_winning_move(pvs: PVStore) -> Optional[str]:
     cp1 = pvs.cp.get(1, 0)
     pv1 = pvs.pvline.get(1, "")
@@ -244,8 +282,7 @@ def pick_stable_winning_move(pvs: PVStore) -> Optional[str]:
         drop = max(0, cp1 - cp)
         if drop > TASO_STABLE_DROP:
             continue
-        pref = common_prefix_len(pv1, pv, TASO_PREFIX_K)
-        score = -drop + pref * 5
+        score = -drop + common_prefix_len(pv1, pv, TASO_PREFIX_K) * 5
         if score > best_score:
             best_score = score
             best = mv
@@ -266,15 +303,11 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
         if drop > TASO_ANNOY_MAX_DROP:
             continue
         pref = common_prefix_len(pv1, pv, TASO_PREFIX_K)
-        score = (TASO_PREFIX_K - pref) * TASO_EVIL_EARLY_DIVERGE_W
+        score = (TASO_PREFIX_K - pref) * 10
         if pref == 2:
-            score += TASO_EVIL_TWOPLY_BONUS
+            score += 40
         if pref == 1:
-            score += TASO_EVIL_FAKE_CONV_BONUS
-        if pref >= 3:
-            score -= TASO_EVIL_LONGPREFIX_PENALTY * (pref - 2)
-        if TASO_EVIL_MID_DROP_MIN <= drop <= TASO_EVIL_MID_DROP_MAX:
-            score += TASO_EVIL_MID_DROP_BONUS
+            score += 18
         if score > best_score:
             best_score = score
             cand = [mv]
@@ -282,9 +315,10 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
             cand.append(mv)
     return random.choice(cand) if cand else pvs.move.get(1)
 
-# --------------------------
-# main loop
-# --------------------------
+
+# ---------------------------------------------------------
+# Main USI loop
+# ---------------------------------------------------------
 def main() -> None:
     if not os.path.isfile(FUKA_BIN):
         out("id name TASO (fukauraou missing)")
@@ -294,9 +328,9 @@ def main() -> None:
 
     eng = ChildEngine([FUKA_BIN])
     pvs = PVStore()
+    hys = HysteresisState()
     turn_sign = 1
 
-    # 修正②: Hash option 多重送信
     def apply_opts() -> None:
         eng.send(f"setoption name Threads value {TASO_THREADS}")
         eng.send(f"setoption name USI_Hash value {TASO_HASH_MB}")
@@ -313,7 +347,7 @@ def main() -> None:
             if line == "usi":
                 eng.send("usi")
                 while True:
-                    o = eng.readline(READ_TIMEOUT_SEC)
+                    o = eng.recv(READ_TIMEOUT_SEC)
                     if not o:
                         break
                     out(o)
@@ -324,8 +358,9 @@ def main() -> None:
 
             if line == "isready":
                 eng.send("isready")
-                while True:
-                    o = eng.readline(READ_TIMEOUT_SEC)
+                t0 = time.time()
+                while time.time() - t0 < READ_TIMEOUT_SEC:
+                    o = eng.recv(READ_TIMEOUT_SEC)
                     if o and o.startswith("readyok"):
                         break
                 out("readyok")
@@ -339,14 +374,10 @@ def main() -> None:
             if line.startswith("go"):
                 pvs.reset()
                 eng.send(line)
-                best_engine: Optional[str] = None
+                best_engine = None
 
-                seen = 0
-                while True:
-                    seen += 1
-                    if seen > LINE_LIMIT:
-                        break
-                    o = eng.readline(READ_TIMEOUT_SEC)
+                for _ in range(LINE_LIMIT):
+                    o = eng.recv(READ_TIMEOUT_SEC)
                     if not o:
                         break
 
@@ -383,36 +414,44 @@ def main() -> None:
                         break
 
                 cp1 = pvs.cp.get(1, 0)
-                out(f"info string humanscore={human_score(cp1):.2f}")
+                hs = human_score(cp1)
+                mode = hys.update(hs)
+
+                out(f"info string humanscore={hs:.2f} mode={mode}")
 
                 override = best_engine or "resign"
 
-                # --- 修正③: 意思決定の可視化 ---
                 best_short: Optional[Tuple[int, str]] = None
                 for i, m in pvs.mate.items():
                     mt = parse_mate(m)
                     mv = pvs.move.get(i)
-                    if mt and mv and (best_short is None or mt < best_short[0]):
-                        best_short = (mt, mv)
+                    if mt is not None and mt > 0 and mv:
+                        if best_short is None or mt < best_short[0]:
+                            best_short = (mt, mv)
 
                 if best_short and best_short[0] <= TASO_SHORT_MATE_MAX:
-                    say(f"⚡ 短手数詰み優先 (mate {best_short[0]})")
+                    say(f"⚡ short-mate priority (mate {best_short[0]})")
                     override = best_short[1]
+
                 else:
                     has_long_mate = any(
-                        parse_mate(m) and parse_mate(m) > TASO_LONG_MATE_IGNORE
+                        (mt := parse_mate(m)) is not None and mt > TASO_LONG_MATE_IGNORE
                         for m in pvs.mate.values()
                     )
+
                     if is_hisshi_position(pvs) and not has_long_mate:
-                        say("🔒 必至優先（長い詰みは保留）")
+                        say("🔒 hisshi priority")
                         override = pick_stable_winning_move(pvs) or override
-                    elif cp1 >= TASO_WIN_CP:
+
+                    elif mode == MODE_STABLE:
+                        say("🧱 stable mode (hysteresis)")
                         override = pick_stable_winning_move(pvs) or override
-                    elif cp1 <= TASO_LOSE_CP:
+
+                    elif mode == MODE_ANNOY:
+                        say("🪤 annoy mode (hysteresis)")
                         override = pick_annoying_losing_move(pvs) or override
 
                 out(f"bestmove {override}")
-                apply_opts()
                 continue
 
             if line == "quit":
@@ -422,6 +461,7 @@ def main() -> None:
 
     finally:
         eng.close()
+
 
 if __name__ == "__main__":
     main()
