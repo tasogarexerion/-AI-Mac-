@@ -10,7 +10,7 @@ import random
 import re
 import threading
 import queue
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Set
 
 # =========================================================
 # TASO Engine (Python) — FUKAURAOU ONLY
@@ -22,7 +22,7 @@ from typing import Dict, Optional, List, Tuple
 # - Hash option multi-send (NNUE compatibility)
 # - HumanScore hysteresis for style stability
 # - Short mate priority
-# - Hisshi / Stable / Annoy personalities
+# - Hisshi / Stable / Annoy / Poison personalities
 # - GO: always drains until bestmove (stop + keep draining)
 # - CWD FIX: child engine runs in its own directory (eval/book relative ok)
 # - BrokenPipe safe
@@ -42,6 +42,10 @@ FUKA_BIN = os.environ.get(
 TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
 TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
 TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
+
+# CP視点：通常は「手番側(=side to move)」で十分。
+# もしエンジンが「先手(black)固定」なら TASO_CP_PERSPECTIVE=black にして turn_sign を掛ける。
+TASO_CP_PERSPECTIVE = os.environ.get("TASO_CP_PERSPECTIVE", "stm").lower()  # stm / black
 
 # ---------------------------------------------------------
 # Evaluation thresholds (cp)
@@ -79,9 +83,9 @@ HS_STABLE_EXIT  = float(os.environ.get("TASO_HS_STABLE_EXIT",  "0.60"))
 HS_ANNOY_ENTER  = float(os.environ.get("TASO_HS_ANNOY_ENTER",  "0.35"))
 HS_ANNOY_EXIT   = float(os.environ.get("TASO_HS_ANNOY_EXIT",   "0.40"))
 
-POISON_ENTER = -600 
-POISON_EXIT  = -350
-
+# 毒饅頭（POISON）
+POISON_ENTER = int(os.environ.get("TASO_POISON_ENTER", "-600"))
+POISON_EXIT  = int(os.environ.get("TASO_POISON_EXIT",  "-350"))
 POISON_RECOVER_DELTA = int(os.environ.get("TASO_POISON_RECOVER_DELTA", "350"))
 
 MODE_NORMAL = "NORMAL"
@@ -97,7 +101,6 @@ def out(s: str) -> None:
         sys.stdout.write(s + "\n")
         sys.stdout.flush()
     except BrokenPipeError:
-        # GUI or pipe closed; exit quietly
         try:
             sys.exit(0)
         except SystemExit:
@@ -119,6 +122,7 @@ def say(s: str) -> None:
 # Utility helpers
 # ---------------------------------------------------------
 _INT_RE = re.compile(r"^-?\d+$")
+_OPT_RE = re.compile(r"^option name (.+?) type ", re.IGNORECASE)
 
 def is_int(s: str) -> bool:
     return bool(_INT_RE.match(s))
@@ -127,7 +131,6 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 def human_score(cp: int) -> float:
-    shifted = cp + 300
     x = cp / 1100.0
     h = 1.0 / (1.0 + math.exp(-x))
     if abs(cp) >= ENDGAME_CP:
@@ -150,6 +153,9 @@ def parse_mate(m: Optional[str]) -> Optional[int]:
         return None
 
 def turn_sign_from_position(line: str) -> int:
+    """
+    先手視点固定のエンジン向け補助（通常は不要）
+    """
     toks = line.split()
     if "startpos" in toks and "moves" in toks:
         mc = len(toks) - toks.index("moves") - 1
@@ -161,18 +167,12 @@ def turn_sign_from_position(line: str) -> int:
     return 1
 
 def _parse_go_hard_limit_sec(go_line: str) -> float:
-    """
-    Rough hard limit from go command (byoyomi/btime/wtime).
-    We don't need perfect; just avoid infinite wait.
-    """
     toks = go_line.split()
-    # byoyomi in ms
     if "byoyomi" in toks:
         i = toks.index("byoyomi")
         if i + 1 < len(toks) and is_int(toks[i + 1]):
             ms = int(toks[i + 1])
             return max(1.0, ms / 1000.0) + GO_HARD_MARGIN_SEC
-    # btime/wtime in ms: pick smaller as "must return soon"
     bt = None
     wt = None
     if "btime" in toks:
@@ -186,32 +186,41 @@ def _parse_go_hard_limit_sec(go_line: str) -> float:
     if bt is not None or wt is not None:
         ms = min([v for v in [bt, wt] if v is not None])
         return max(1.0, ms / 1000.0) + GO_HARD_MARGIN_SEC
-    # fallback
     return GO_DEFAULT_HARD_SEC
 
 # ---------------------------------------------------------
-# HumanScore hysteresis state
+# HumanScore hysteresis + POISON
 # ---------------------------------------------------------
 class HysteresisState:
     def __init__(self) -> None:
         self.mode = MODE_NORMAL
-        self.last_cp = None
+        self.last_cp: Optional[int] = None
 
     def update(self, cp: int) -> str:
-        # 初回
         if self.last_cp is None:
             self.last_cp = cp
+            # 初手から毒はさすがにやらない（必要なら外してOK）
             return self.mode
 
         delta = cp - self.last_cp
         self.last_cp = cp
 
-        # --- 毒解除（相手の大ミス） ---
-        if self.mode == MODE_ANNOY and delta >= POISON_RECOVER_DELTA:
-            self.mode = MODE_NORMAL
+        # ---- POISON解除（相手の大ミス or 自分が盛り返した）----
+        if self.mode == MODE_POISON:
+            if delta >= POISON_RECOVER_DELTA:
+                self.mode = MODE_NORMAL
+                return self.mode
+            if cp >= POISON_EXIT:
+                self.mode = MODE_NORMAL
+                return self.mode
+
+        # ---- POISON突入（ある程度負けてる時に“判断を要求する”）----
+        # ※STABLEより優先、ANNOYよりは強い「最終兵器」扱い
+        if self.mode != MODE_POISON and cp <= POISON_ENTER:
+            self.mode = MODE_POISON
             return self.mode
 
-        # --- 通常ヒステリシス ---
+        # ---- 通常ヒステリシス ----
         hs = human_score(cp)
 
         if self.mode == MODE_NORMAL:
@@ -229,6 +238,7 @@ class HysteresisState:
                 self.mode = MODE_NORMAL
 
         return self.mode
+
 # ---------------------------------------------------------
 # Child engine (ReaderThread safe) + CWD FIX
 # ---------------------------------------------------------
@@ -243,7 +253,7 @@ class ChildEngine:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            cwd=engine_cwd,  # critical: eval/ book/ relative paths
+            cwd=engine_cwd,
         )
         self.q: queue.Queue[str] = queue.Queue()
         self.alive = True
@@ -342,16 +352,10 @@ def is_hisshi_position(pvs: PVStore) -> bool:
 # Safe move filter (avoid self-mate)
 # ---------------------------------------------------------
 def filter_safe_moves(pvs: PVStore) -> PVStore:
-    """
-    Remove moves that lead to immediate self-mate (mate < 0).
-    If all moves are losing, return original pvs.
-    """
     safe_indices = {
         i for i, m in pvs.mate.items()
         if m is None or int(m) >= 0
     }
-
-    # 全部詰みならそのまま返す
     if not safe_indices:
         return pvs
 
@@ -367,7 +371,6 @@ def filter_safe_moves(pvs: PVStore) -> PVStore:
             new.mate[i] = pvs.mate[i]
         if i in pvs.depth:
             new.depth[i] = pvs.depth[i]
-
     return new
 
 # ---------------------------------------------------------
@@ -420,13 +423,13 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
             cand.append(mv)
     return random.choice(cand) if cand else pvs.move.get(1)
 
-def pick_poison_move(pvs):
+def pick_poison_move(pvs: PVStore) -> Optional[str]:
     """
-    敢えて評価を少し落とし、
-    相手に判断を要求する手を選ぶ。
+    毒饅頭：わざと“少しだけ”評価を落として、
+    相手に判断を要求する分岐を選ぶ（ただし即死級は除外）。
     """
     base_cp = pvs.cp.get(1, 0)
-    base_pv = pvs.pv.get(1, "")
+    base_pv = pvs.pvline.get(1, "")
 
     best_score = -10**9
     best_move = None
@@ -434,31 +437,33 @@ def pick_poison_move(pvs):
     for i in range(2, TASO_MULTIPV + 1):
         mv = pvs.move.get(i)
         cp = pvs.cp.get(i)
-        pv = pvs.pv.get(i, "")
+        pv = pvs.pvline.get(i, "")
 
         if not mv or cp is None:
             continue
 
-        # 悪すぎる手は除外（即死防止）
+        # 悪すぎる手は除外（即死っぽいのを避ける）
         if cp < -1200:
             continue
 
         # 評価が下がるほど加点（=毒）
-        delta = base_cp - cp
+        delta = base_cp - cp  # + なら評価を落としている
 
-        # 序盤で分岐するほど加点
+        # 分岐が早いほど加点
         divergence = TASO_PREFIX_K - common_prefix_len(base_pv, pv, TASO_PREFIX_K)
 
+        # ほどほどに毒：落としすぎもダメ、分岐は欲しい
         score = (
-            divergence * 30     # 人間が迷う度
-            - abs(cp) * 0.15    # 悪くなりすぎない制限
+            divergence * 30
+            + min(250, max(0, delta)) * 0.8
+            - max(0, -cp) * 0.12
         )
 
         if score > best_score:
             best_score = score
             best_move = mv
 
-    return best_move
+    return best_move or pvs.move.get(1)
 
 # ---------------------------------------------------------
 # Main USI loop
@@ -475,26 +480,30 @@ def main() -> None:
     eng = ChildEngine([fuka])
     pvs = PVStore()
     hys = HysteresisState()
-    turn_sign = 1
-    last_cp = None
+
+    available_opts: Set[str] = set()
+    turn_sign = 1  # TASO_CP_PERSPECTIVE=black のときだけ使う
+
+    def _record_option_line(line: str) -> None:
+        m = _OPT_RE.match(line)
+        if m:
+            name = m.group(1).strip()
+            if name:
+                available_opts.add(name)
+
+    def _send_opt(name: str, value: str) -> None:
+        # optionが取れてない場合は「送りすぎて怒られる」より「送り控え」を優先
+        if available_opts and name not in available_opts:
+            return
+        eng.send(f"setoption name {name} value {value}")
 
     def apply_opts() -> None:
-        # send multiple hash aliases for compatibility
-        eng.send(f"setoption name Threads value {TASO_THREADS}")
-        eng.send(f"setoption name USI_Hash value {TASO_HASH_MB}")
-        eng.send(f"setoption name Hash value {TASO_HASH_MB}")
-        eng.send(f"setoption name HashSize value {TASO_HASH_MB}")
-        eng.send(f"setoption name MultiPV value {TASO_MULTIPV}")
-
-    def drain_until(prefix: str, timeout_sec: float) -> None:
-        t0 = time.time()
-        while time.time() - t0 < timeout_sec:
-            o = eng.recv(READ_TIMEOUT_SEC)
-            if not o:
-                continue
-            out(o)
-            if o.startswith(prefix):
-                return
+        _send_opt("Threads", str(TASO_THREADS))
+        # Hash系は存在するものだけ送る
+        _send_opt("USI_Hash", str(TASO_HASH_MB))
+        _send_opt("Hash", str(TASO_HASH_MB))
+        _send_opt("HashSize", str(TASO_HASH_MB))
+        _send_opt("MultiPV", str(TASO_MULTIPV))
 
     try:
         for raw in sys.stdin:
@@ -503,12 +512,13 @@ def main() -> None:
                 continue
 
             if line == "usi":
+                available_opts.clear()
                 eng.send("usi")
-                # forward until child usiok
                 while True:
                     o = eng.recv(READ_TIMEOUT_SEC)
                     if o is None:
                         continue
+                    _record_option_line(o)
                     out(o)
                     if o.startswith("usiok"):
                         break
@@ -517,14 +527,12 @@ def main() -> None:
 
             if line == "isready":
                 eng.send("isready")
-                # forward until readyok (but always answer readyok)
                 t0 = time.time()
                 got = False
                 while time.time() - t0 < 10.0:
                     o = eng.recv(READ_TIMEOUT_SEC)
                     if not o:
                         continue
-                    # some engines print logs before readyok; forward them
                     if o.startswith("info"):
                         out(o)
                     if o.startswith("readyok"):
@@ -534,12 +542,12 @@ def main() -> None:
                 continue
 
             if line.startswith("position"):
+                # 先手固定視点のための符号（通常stmなら使わない）
                 turn_sign = turn_sign_from_position(line)
                 eng.send(line)
                 continue
 
             if line.startswith("setoption"):
-                # pass through
                 eng.send(line)
                 continue
 
@@ -554,11 +562,9 @@ def main() -> None:
 
                 best_engine: Optional[str] = None
 
-                # ALWAYS drain until bestmove (or hard timeout)
                 for _ in range(LINE_LIMIT):
                     now = time.time()
                     if now - t_start > hard_limit:
-                        # hard fail-safe
                         if not sent_stop:
                             eng.send("stop")
                             sent_stop = True
@@ -566,7 +572,6 @@ def main() -> None:
 
                     o = eng.recv(READ_TIMEOUT_SEC)
                     if o is None:
-                        # silence handling: if too long, send stop once, then keep draining
                         if (now - last_rx) >= GO_SILENCE_STOP_SEC and not sent_stop:
                             eng.send("stop")
                             sent_stop = True
@@ -601,13 +606,14 @@ def main() -> None:
                                 pv = " ".join(toks[i + 1 :])
                                 mv = toks[i + 1]
 
-                        # score cp
                         if "score" in toks and "cp" in toks:
                             j = toks.index("cp")
                             if j + 1 < len(toks) and is_int(toks[j + 1]):
-                                cp = int(toks[j + 1]) * turn_sign
+                                raw_cp = int(toks[j + 1])
+                                # stm: そのまま（手番側視点）
+                                # black: 先手視点固定のエンジンなら turn_sign を掛ける
+                                cp = raw_cp if TASO_CP_PERSPECTIVE == "stm" else (raw_cp * turn_sign)
 
-                        # mate (may be +N / -N / etc.)
                         if "mate" in toks:
                             j = toks.index("mate")
                             if j + 1 < len(toks):
@@ -622,15 +628,17 @@ def main() -> None:
                             best_engine = parts[1]
                         break
 
-                    # forward any other lines
                     out(o)
 
                 # Decide (override) based on PV snapshot
                 cp1 = pvs.cp.get(1, 0)
                 hs = human_score(cp1)
                 mode = hys.update(cp1)
+
+                # 自玉詰みは落とす
                 pvs = filter_safe_moves(pvs)
-                out(f"info string humanscore={hs:.2f} mode={mode}")
+
+                out(f"info string humanscore={hs:.2f} mode={mode} cp={cp1:+d} (persp={TASO_CP_PERSPECTIVE})")
 
                 override = best_engine or "resign"
 
@@ -652,7 +660,10 @@ def main() -> None:
                         for m in pvs.mate.values()
                     )
 
-                    if is_hisshi_position(pvs) and not has_long_mate:
+                    if mode == MODE_POISON:
+                        say("🍡☠ poison mode (force tough decision)")
+                        override = pick_poison_move(pvs) or override
+                    elif is_hisshi_position(pvs) and not has_long_mate:
                         say("🔒 hisshi priority")
                         override = pick_stable_winning_move(pvs) or override
                     elif mode == MODE_STABLE:
@@ -668,7 +679,6 @@ def main() -> None:
             if line == "quit":
                 break
 
-            # pass through anything else
             eng.send(line)
 
     finally:
