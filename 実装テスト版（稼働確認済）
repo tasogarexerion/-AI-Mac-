@@ -26,7 +26,6 @@ from typing import Dict, Optional, List, Tuple
 # - GO: always drains until bestmove (stop + keep draining)
 # - CWD FIX: child engine runs in its own directory (eval/book relative ok)
 # - BrokenPipe safe
-# - (NEW) raw_cp / self_cp display + robust side-to-move handling
 # =========================================================
 
 # ---------------------------------------------------------
@@ -44,6 +43,13 @@ TASO_THREADS = int(os.environ.get("TASO_THREADS", "8"))
 TASO_HASH_MB = int(os.environ.get("TASO_HASH_MB", "1024"))
 TASO_MULTIPV = int(os.environ.get("TASO_MULTIPV", "3"))
 
+# score perspective:
+# - 'stm'   : engine reports from side-to-move perspective (USI/UCI standard).
+# - 'black' : engine reports from black/sente perspective (some tools do).
+TASO_SCORE_PERSPECTIVE = os.environ.get("TASO_SCORE_PERSPECTIVE", "stm").lower()
+if TASO_SCORE_PERSPECTIVE not in ("stm", "black"):
+    TASO_SCORE_PERSPECTIVE = "stm"
+
 # ---------------------------------------------------------
 # Evaluation thresholds (cp)
 # ---------------------------------------------------------
@@ -54,6 +60,10 @@ ENDGAME_CP   = int(os.environ.get("TASO_ENDGAME_CP", "800"))
 TASO_STABLE_DROP    = int(os.environ.get("TASO_STABLE_DROP", "120"))
 TASO_PREFIX_K       = int(os.environ.get("TASO_PREFIX_K", "4"))
 TASO_ANNOY_MAX_DROP = int(os.environ.get("TASO_ANNOY_MAX_DROP", "180"))
+
+# Poison mode ("毒饅頭") knobs
+TASO_POISON_MIN_CP  = int(os.environ.get("TASO_POISON_MIN_CP",  "-1200"))
+TASO_POISON_MAX_DROP = int(os.environ.get("TASO_POISON_MAX_DROP", "280"))
 
 # Mate / hisshi
 TASO_SHORT_MATE_MAX   = int(os.environ.get("TASO_SHORT_MATE_MAX", "7"))
@@ -80,7 +90,7 @@ HS_STABLE_EXIT  = float(os.environ.get("TASO_HS_STABLE_EXIT",  "0.60"))
 HS_ANNOY_ENTER  = float(os.environ.get("TASO_HS_ANNOY_ENTER",  "0.35"))
 HS_ANNOY_EXIT   = float(os.environ.get("TASO_HS_ANNOY_EXIT",   "0.40"))
 
-# Poison mode (自分視点cpで判定する)
+# poison thresholds (cp is side-to-move view)
 POISON_ENTER = int(os.environ.get("TASO_POISON_ENTER", "-600"))
 POISON_EXIT  = int(os.environ.get("TASO_POISON_EXIT",  "-350"))
 POISON_RECOVER_DELTA = int(os.environ.get("TASO_POISON_RECOVER_DELTA", "350"))
@@ -126,11 +136,11 @@ def is_int(s: str) -> bool:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-def human_score(cp_self: int) -> float:
-    # cp_self: 「いま指す側」視点で、良いほどプラス
-    x = cp_self / 1100.0
+def human_score(cp: int) -> float:
+    # cp is side-to-move view
+    x = cp / 1100.0
     h = 1.0 / (1.0 + math.exp(-x))
-    if abs(cp_self) >= ENDGAME_CP:
+    if abs(cp) >= ENDGAME_CP:
         h = 0.5 + (h - 0.5) * 1.3
     return clamp(h, 0.05, 0.95)
 
@@ -144,35 +154,24 @@ def common_prefix_len(a: str, b: str, k: int) -> int:
 def parse_mate(m: Optional[str]) -> Optional[int]:
     if m is None:
         return None
-    s = m.strip()
-    if s.startswith("+"):
-        s = s[1:]
     try:
-        return int(s)
+        return int(m)
     except Exception:
         return None
 
-def turn_sign_from_position(line: str) -> int:
+def stm_sign_from_position(line: str) -> int:
     """
-    返り値:
-      +1 => 先手番（b）
-      -1 => 後手番（w）
+    +1 : black/sente to move
+    -1 : white/gote to move
     """
     toks = line.split()
-
-    # startpos moves ...
     if "startpos" in toks and "moves" in toks:
         mc = len(toks) - toks.index("moves") - 1
         return 1 if mc % 2 == 0 else -1
-
-    # sfen ... <turn> ...
     if "sfen" in toks:
         i = toks.index("sfen")
-        # sfen <board> <turn> <hand> <moveNumber>
         if len(toks) > i + 2:
             return 1 if toks[i + 2] == "b" else -1
-
-    # fallback
     return 1
 
 def _parse_go_hard_limit_sec(go_line: str) -> float:
@@ -182,7 +181,6 @@ def _parse_go_hard_limit_sec(go_line: str) -> float:
         if i + 1 < len(toks) and is_int(toks[i + 1]):
             ms = int(toks[i + 1])
             return max(1.0, ms / 1000.0) + GO_HARD_MARGIN_SEC
-
     bt = None
     wt = None
     if "btime" in toks:
@@ -193,11 +191,9 @@ def _parse_go_hard_limit_sec(go_line: str) -> float:
         i = toks.index("wtime")
         if i + 1 < len(toks) and is_int(toks[i + 1]):
             wt = int(toks[i + 1])
-
     if bt is not None or wt is not None:
         ms = min([v for v in [bt, wt] if v is not None])
         return max(1.0, ms / 1000.0) + GO_HARD_MARGIN_SEC
-
     return GO_DEFAULT_HARD_SEC
 
 # ---------------------------------------------------------
@@ -206,38 +202,30 @@ def _parse_go_hard_limit_sec(go_line: str) -> float:
 class HysteresisState:
     def __init__(self) -> None:
         self.mode = MODE_NORMAL
-        self.last_cp: Optional[int] = None  # self cp
+        self.last_cp: Optional[int] = None
 
-    def update(self, cp_self: int) -> str:
-        # 初回
+    def update(self, cp: int) -> str:
+        # cp は「手番側視点」の評価
         if self.last_cp is None:
-            self.last_cp = cp_self
-            # poison判定は初回でも通す
-            if cp_self <= POISON_ENTER:
-                self.mode = MODE_POISON
+            self.last_cp = cp
             return self.mode
 
-        delta = cp_self - self.last_cp
-        self.last_cp = cp_self
+        delta = cp - self.last_cp
+        self.last_cp = cp
 
-        # --- Poison（最優先：形勢が悪すぎるとき） ---
-        if self.mode != MODE_POISON and cp_self <= POISON_ENTER:
-            self.mode = MODE_POISON
-            return self.mode
-
+        # --- 毒饅頭（POISON）ヒステリシス ---
         if self.mode == MODE_POISON:
-            # 相手の大ミスなどで戻る
-            if cp_self >= POISON_EXIT or delta >= POISON_RECOVER_DELTA:
+            if cp >= POISON_EXIT or delta >= POISON_RECOVER_DELTA:
                 self.mode = MODE_NORMAL
-            return self.mode
-
-        # --- 毒解除（相手の大ミス） ---
-        if self.mode == MODE_ANNOY and delta >= POISON_RECOVER_DELTA:
-            self.mode = MODE_NORMAL
-            return self.mode
+            else:
+                return self.mode
+        else:
+            if cp <= POISON_ENTER:
+                self.mode = MODE_POISON
+                return self.mode
 
         # --- 通常ヒステリシス ---
-        hs = human_score(cp_self)
+        hs = human_score(cp)
 
         if self.mode == MODE_NORMAL:
             if hs >= HS_STABLE_ENTER:
@@ -250,7 +238,9 @@ class HysteresisState:
                 self.mode = MODE_NORMAL
 
         elif self.mode == MODE_ANNOY:
-            if hs >= HS_ANNOY_EXIT:
+            if delta >= POISON_RECOVER_DELTA:
+                self.mode = MODE_NORMAL
+            elif hs >= HS_ANNOY_EXIT:
                 self.mode = MODE_NORMAL
 
         return self.mode
@@ -269,7 +259,7 @@ class ChildEngine:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            cwd=engine_cwd,  # critical: eval/ book/ relative paths
+            cwd=engine_cwd,
         )
         self.q: queue.Queue[str] = queue.Queue()
         self.alive = True
@@ -312,8 +302,7 @@ class ChildEngine:
 class PVStore:
     def __init__(self) -> None:
         self.move: Dict[int, str] = {}
-        self.cp: Dict[int, int] = {}          # self cp (side-to-move aligned)
-        self.raw_cp: Dict[int, int] = {}      # raw cp as printed by engine
+        self.cp: Dict[int, int] = {}
         self.mate: Dict[int, str] = {}
         self.depth: Dict[int, int] = {}
         self.pvline: Dict[int, str] = {}
@@ -321,7 +310,6 @@ class PVStore:
     def reset(self) -> None:
         self.move.clear()
         self.cp.clear()
-        self.raw_cp.clear()
         self.mate.clear()
         self.depth.clear()
         self.pvline.clear()
@@ -332,8 +320,7 @@ class PVStore:
         depth: int,
         mv: Optional[str],
         pv: Optional[str],
-        cp_self: Optional[int],
-        cp_raw: Optional[int],
+        cp: Optional[int],
         mate: Optional[str],
     ) -> None:
         if depth < self.depth.get(mpv, -1):
@@ -343,10 +330,8 @@ class PVStore:
             self.move[mpv] = mv
         if pv:
             self.pvline[mpv] = pv
-        if cp_self is not None:
-            self.cp[mpv] = cp_self
-        if cp_raw is not None:
-            self.raw_cp[mpv] = cp_raw
+        if cp is not None:
+            self.cp[mpv] = cp
         if mate is not None:
             self.mate[mpv] = mate
 
@@ -375,13 +360,19 @@ def is_hisshi_position(pvs: PVStore) -> bool:
 def filter_safe_moves(pvs: PVStore) -> PVStore:
     """
     Remove moves that lead to immediate self-mate (mate < 0).
-    If all moves are losing, return original pvs.
+    - If a PV line has no mate info, treat it as safe.
+    - If all PVs look losing by mate, return original pvs.
     """
     safe_indices = set()
-    for i in range(1, TASO_MULTIPV + 1):
+    for i in pvs.move.keys():
         m = pvs.mate.get(i)
-        mt = parse_mate(m)
-        if mt is None or mt >= 0:
+        if m is None:
+            safe_indices.add(i)
+            continue
+        try:
+            if int(m) >= 0:
+                safe_indices.add(i)
+        except Exception:
             safe_indices.add(i)
 
     if not safe_indices:
@@ -393,14 +384,13 @@ def filter_safe_moves(pvs: PVStore) -> PVStore:
             new.move[i] = pvs.move[i]
         if i in pvs.cp:
             new.cp[i] = pvs.cp[i]
-        if i in pvs.raw_cp:
-            new.raw_cp[i] = pvs.raw_cp[i]
         if i in pvs.pvline:
             new.pvline[i] = pvs.pvline[i]
         if i in pvs.mate:
             new.mate[i] = pvs.mate[i]
         if i in pvs.depth:
             new.depth[i] = pvs.depth[i]
+
     return new
 
 # ---------------------------------------------------------
@@ -455,45 +445,46 @@ def pick_annoying_losing_move(pvs: PVStore) -> Optional[str]:
 
 def pick_poison_move(pvs: PVStore) -> Optional[str]:
     """
-    形勢が悪いとき、敢えて少し評価を落としてでも
-    相手に判断を要求する（分岐/嫌味）手を選ぶ。
-    ※ cp は self 視点で評価している前提。
+    "毒饅頭": ほんの少し評価を落として分岐を作り、
+    相手に判断を要求する（= 人間相手に勝ちやすい）方向の手を選ぶ。
+
+    前提:
+    - cp は「手番側視点」の評価。
     """
     base_cp = pvs.cp.get(1, 0)
     base_pv = pvs.pvline.get(1, "")
 
-    best_score = -10**9
-    best_move = None
+    best_score = -1.0e18
+    best_move: Optional[str] = None
 
     for i in range(2, TASO_MULTIPV + 1):
         mv = pvs.move.get(i)
         cp = pvs.cp.get(i)
         pv = pvs.pvline.get(i, "")
 
-        if not mv or cp is None:
+        if not mv or cp is None or not pv:
             continue
 
-        # 悪すぎる手は除外（即死/投了級の崩壊を避ける）
-        if cp < -1200:
+        if cp < TASO_POISON_MIN_CP:
             continue
 
-        # 評価が下がるほど加点（=毒）
-        delta = base_cp - cp
+        drop = max(0, base_cp - cp)
+        if drop > TASO_POISON_MAX_DROP:
+            continue
 
-        # 分岐が早いほど加点
         divergence = TASO_PREFIX_K - common_prefix_len(base_pv, pv, TASO_PREFIX_K)
 
         score = (
-            divergence * 30
-            + delta * 0.25
-            - abs(cp) * 0.10
+            divergence * 50.0
+            + drop * 0.5
+            - abs(cp) * 0.05
         )
 
         if score > best_score:
             best_score = score
             best_move = mv
 
-    return best_move
+    return best_move or pvs.move.get(1)
 
 # ---------------------------------------------------------
 # Main USI loop
@@ -510,14 +501,12 @@ def main() -> None:
     eng = ChildEngine([fuka])
     pvs = PVStore()
     hys = HysteresisState()
-
-    # 直近 position を保持（GUIが go だけ送ってくるケースの保険）
-    last_position_line: Optional[str] = None
-    turn_sign = 1  # +1: 先手番 / -1: 後手番
+    stm_sign = 1  # +1 black-to-move, -1 white-to-move
 
     def apply_opts() -> None:
         eng.send(f"setoption name Threads value {TASO_THREADS}")
         eng.send(f"setoption name USI_Hash value {TASO_HASH_MB}")
+        # aliases (some engines accept, some reject; harmless)
         eng.send(f"setoption name Hash value {TASO_HASH_MB}")
         eng.send(f"setoption name HashSize value {TASO_HASH_MB}")
         eng.send(f"setoption name MultiPV value {TASO_MULTIPV}")
@@ -553,12 +542,11 @@ def main() -> None:
                     if o.startswith("readyok"):
                         got = True
                         break
-                out("readyok")
+                out("readyok" if got else "readyok")
                 continue
 
             if line.startswith("position"):
-                last_position_line = line
-                turn_sign = turn_sign_from_position(line)
+                stm_sign = stm_sign_from_position(line)
                 eng.send(line)
                 continue
 
@@ -567,10 +555,6 @@ def main() -> None:
                 continue
 
             if line.startswith("go"):
-                # position 省略のGUI対策：最後のpositionを再送して同期
-                if last_position_line is not None:
-                    eng.send(last_position_line)
-
                 pvs.reset()
                 eng.send(line)
 
@@ -599,15 +583,12 @@ def main() -> None:
                     last_rx = time.time()
 
                     if o.startswith("info"):
-                        # 生ログはそのままGUIへ
                         out(o)
-
                         toks = o.split()
 
                         mpv = 1
                         depth = 0
-                        cp_raw: Optional[int] = None
-                        cp_self: Optional[int] = None
+                        cp: Optional[int] = None
                         mate: Optional[str] = None
                         pv: Optional[str] = None
                         mv: Optional[str] = None
@@ -628,20 +609,22 @@ def main() -> None:
                                 pv = " ".join(toks[i + 1 :])
                                 mv = toks[i + 1]
 
-                        # score cp (raw)
+                        # score cp
                         if "score" in toks and "cp" in toks:
                             j = toks.index("cp")
                             if j + 1 < len(toks) and is_int(toks[j + 1]):
-                                cp_raw = int(toks[j + 1])
-                                # self視点に変換（先手視点rawを仮定して補正）
-                                cp_self = cp_raw * turn_sign
+                                raw_cp = int(toks[j + 1])
+                                if TASO_SCORE_PERSPECTIVE == "black":
+                                    cp = raw_cp * stm_sign  # black-perspective -> side-to-move
+                                else:
+                                    cp = raw_cp            # already side-to-move
 
                         if "mate" in toks:
                             j = toks.index("mate")
                             if j + 1 < len(toks):
                                 mate = toks[j + 1]
 
-                        pvs.snapshot(mpv, depth, mv, pv, cp_self, cp_raw, mate)
+                        pvs.snapshot(mpv, depth, mv, pv, cp, mate)
                         continue
 
                     if o.startswith("bestmove"):
@@ -653,21 +636,14 @@ def main() -> None:
                     out(o)
 
                 # Decide (override) based on PV snapshot
-                cp1_self = pvs.cp.get(1, 0)
-                raw1 = pvs.raw_cp.get(1)
-                # rawが取れない場合の保険
-                if raw1 is None:
-                    raw1 = cp1_self * turn_sign
+                cp1 = pvs.cp.get(1, 0)  # side-to-move view
+                hs = human_score(cp1)
+                mode = hys.update(cp1)
 
-                hs = human_score(cp1_self)
-                mode = hys.update(cp1_self)
-
-                # safety: mate<0 を落としてから選ぶ
                 pvs = filter_safe_moves(pvs)
 
-                side = "先手番" if turn_sign == 1 else "後手番"
-                # raw/self 併記（これで後手でも混乱しない）
-                out(f"info string {side} raw_cp={raw1:+d} self_cp={cp1_self:+d} humanscore={hs:.2f} mode={mode}")
+                black_cp = cp1 if stm_sign == 1 else -cp1
+                out(f"info string cp(stm)={cp1:+d} cp(black)={black_cp:+d} humanscore={hs:.2f} mode={mode}")
 
                 override = best_engine or "resign"
 
@@ -696,7 +672,7 @@ def main() -> None:
                         say("🧱 stable mode (hysteresis)")
                         override = pick_stable_winning_move(pvs) or override
                     elif mode == MODE_POISON:
-                        say("☠ poison mode (judge-demanding move)")
+                        say("☠ poison mode (hysteresis)")
                         override = pick_poison_move(pvs) or override
                     elif mode == MODE_ANNOY:
                         say("🪤 annoy mode (hysteresis)")
